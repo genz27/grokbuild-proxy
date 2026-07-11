@@ -93,6 +93,18 @@ jobs:
           cosign sign-blob --yes \
             --bundle dist/checksums.txt.sigstore.json \
             dist/checksums.txt
+      - name: Upload signed recovery assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-assets-${{ inputs.tag }}
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            dist/grokbuild-proxy_*.tar.gz
+            dist/grokbuild-proxy_*.zip
+            dist/*.sbom.json
+            dist/checksums.txt
+            dist/checksums.txt.sigstore.json
       - name: Publish GitHub Release and promote moving image tags
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
