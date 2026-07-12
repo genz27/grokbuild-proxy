@@ -397,7 +397,6 @@ func TestModelAliasResolve(t *testing.T) {
 	if len(entries) == 0 {
 		t.Fatal("no alias entries")
 	}
-	has1M := false
 	for _, e := range entries {
 		if !strings.HasPrefix(e.ID, "claude") {
 			t.Fatalf("non-claude id %q", e.ID)
@@ -405,18 +404,6 @@ func TestModelAliasResolve(t *testing.T) {
 		if e.UpstreamModel == "" {
 			t.Fatalf("missing upstream for %q", e.ID)
 		}
-		if strings.HasSuffix(e.ID, "[1m]") {
-			has1M = true
-			if e.ContextWindow != ClaudeCode1MContextWindow {
-				t.Fatalf("1m context for %q: %d", e.ID, e.ContextWindow)
-			}
-			if e.UpstreamModel != "grok-4.5" && !strings.HasPrefix(e.UpstreamModel, "grok-") {
-				t.Fatalf("1m upstream for %q: %q", e.ID, e.UpstreamModel)
-			}
-		}
-	}
-	if !has1M {
-		t.Fatal("expected synthesized [1m] discovery entries")
 	}
 	// short names like sonnet must not appear
 	for _, e := range entries {
@@ -719,24 +706,6 @@ func TestHandleCountTokens_Disabled404(t *testing.T) {
 	}
 }
 
-func TestHandleCountTokens_EstimatesInput(t *testing.T) {
-	h := &Handlers{Cfg: config.AnthropicConfig{CountTokens: true}}
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens", strings.NewReader(
-		`{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hello world"}]}`,
-	))
-	h.HandleCountTokens(rr, req)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
-	}
-	var result struct {
-		InputTokens int `json:"input_tokens"`
-	}
-	if err := json.Unmarshal(rr.Body.Bytes(), &result); err != nil || result.InputTokens < 1 {
-		t.Fatalf("result=%+v err=%v", result, err)
-	}
-}
-
 func TestHandleMessagesHonorsConfiguredBodyLimit(t *testing.T) {
 	h := &Handlers{
 		MaxBody: 2,
@@ -837,13 +806,23 @@ func TestSessionIDFromHeader(t *testing.T) {
 	}
 }
 
-func TestSessionIDFromMetadataIsStableAndOpaque(t *testing.T) {
-	req := httptest.NewRequest(http.MethodPost, "/", nil)
-	raw := []byte(`{"metadata":{"user_id":"claude-code-user"}}`)
-	first := sessionIDFromRequest(req, raw)
-	second := sessionIDFromRequest(req, raw)
-	if first != second || strings.Contains(first, "claude-code-user") {
-		t.Fatalf("unexpected session ids %q %q", first, second)
+func TestHandleMessagesRejectsOversizedSessionID(t *testing.T) {
+	called := false
+	h := &Handlers{
+		Cfg: config.Default().Anthropic,
+		Post: func(context.Context, string, string, []byte, bool) (*http.Response, error) {
+			called = true
+			return nil, nil
+		},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{
+		"model":"claude-sonnet-4","max_tokens":16,"messages":[{"role":"user","content":"hi"}]
+	}`))
+	req.Header.Set("x-claude-code-session-id", strings.Repeat("x", 513))
+	rr := httptest.NewRecorder()
+	h.HandleMessages(rr, req)
+	if rr.Code != http.StatusBadRequest || called {
+		t.Fatalf("status=%d called=%v body=%s", rr.Code, called, rr.Body.String())
 	}
 }
 

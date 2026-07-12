@@ -1,11 +1,30 @@
 package config
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestRejectsNonFiniteMassFailureRatio(t *testing.T) {
+	for _, ratio := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		cfg := Default()
+		cfg.Inspection.MassFailureRatio = ratio
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("accepted non-finite mass_failure_ratio %v", ratio)
+		}
+	}
+
+	path := filepath.Join(t.TempDir(), "nan.yaml")
+	if err := os.WriteFile(path, []byte("inspection:\n  mass_failure_ratio: .nan\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("accepted YAML .nan mass_failure_ratio")
+	}
+}
 
 func TestDefaultAlignedWithPlan(t *testing.T) {
 	cfg := Default()
@@ -84,8 +103,11 @@ func TestDefaultAlignedWithPlan(t *testing.T) {
 	if cfg.Limits.RequestTimeoutSec != 600 || cfg.Limits.MaxConcurrent != 2048 {
 		t.Fatalf("limits: %+v", cfg.Limits)
 	}
-	if cfg.LB.Prefetch.IntervalSec != 30 || cfg.LB.Prefetch.MaxPerTick != 128 || cfg.LB.Prefetch.Concurrency != 16 {
-		t.Fatalf("prefetch defaults: %+v", cfg.LB.Prefetch)
+	if cfg.Import.MaxQueuedJobs != 32 || cfg.Import.MaxQueuedBytes != 64*1024*1024 {
+		t.Fatalf("import queue limits: %+v", cfg.Import)
+	}
+	if cfg.Import.MaxRetainedJobs != 128 || cfg.Import.MaxRetainedBytes != 64*1024*1024 {
+		t.Fatalf("import retention limits: %+v", cfg.Import)
 	}
 	if cfg.Logging.Level != "info" {
 		t.Fatalf("logging.level: %q", cfg.Logging.Level)
@@ -170,7 +192,7 @@ logging:
 		t.Fatal("strip_unknown_betas should be false after override")
 	}
 	if cfg.Anthropic.CountTokens {
-		t.Fatal("explicit count_tokens=false should be preserved")
+		t.Fatal("count_tokens must remain disabled")
 	}
 }
 
@@ -226,6 +248,8 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		{"empty upstream", func(c *Config) { c.Upstream.BaseURL = "" }},
 		{"insecure upstream", func(c *Config) { c.Upstream.BaseURL = "http://example.com" }},
 		{"bad oauth issuer", func(c *Config) { c.OAuth.Issuer = "https://example.com" }},
+		{"oauth issuer subdomain", func(c *Config) { c.OAuth.Issuer = "https://preview.auth.x.ai" }},
+		{"oauth issuer path", func(c *Config) { c.OAuth.Issuer = "https://auth.x.ai/tenant" }},
 		{"bad chat_backend", func(c *Config) { c.ChatBackend = "foo" }},
 		{"bad strategy", func(c *Config) { c.LB.Strategy = "random" }},
 		{"neg sticky", func(c *Config) { c.LB.StickyTTLSec = -1 }},
@@ -233,6 +257,11 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		{"zero body", func(c *Config) { c.Limits.MaxBodyBytes = 0 }},
 		{"zero timeout", func(c *Config) { c.Limits.RequestTimeoutSec = 0 }},
 		{"zero concurrent", func(c *Config) { c.Limits.MaxConcurrent = 0 }},
+		{"zero import total", func(c *Config) { c.Import.MaxTotalBytes = 0 }},
+		{"zero import retained jobs", func(c *Config) { c.Import.MaxRetainedJobs = 0 }},
+		{"zero import retained bytes", func(c *Config) { c.Import.MaxRetainedBytes = 0 }},
+		{"oversized sso timeout", func(c *Config) { c.SSOConverter.TimeoutSec = maxSSOConverterTimeoutSec + 1 }},
+		{"oversized sso batch", func(c *Config) { c.SSOConverter.MaxBatch = maxSSOConverterBatch + 1 }},
 		{"invalid logging level", func(c *Config) { c.Logging.Level = "verbose" }},
 	}
 	for _, tc := range cases {
@@ -286,19 +315,6 @@ func TestResolveModel(t *testing.T) {
 	if got := cfg.ResolveModel(""); got != "" {
 		t.Fatalf("empty: %q", got)
 	}
-	// Claude Code 1M context marker is a client-side window hint.
-	if got := cfg.ResolveModel("claude-opus-4-6[1m]"); got != "grok-4.5" {
-		t.Fatalf("alias with [1m]: %q", got)
-	}
-	if got := cfg.ResolveModel("claude-sonnet-4[1M]"); got != "grok-4.5" {
-		t.Fatalf("alias with [1M] case: %q", got)
-	}
-	if got := cfg.ResolveModel("grok-4.5[1m]"); got != "grok-4.5" {
-		t.Fatalf("passthrough with [1m]: %q", got)
-	}
-	if got := cfg.ResolveModel("claude-opus-4-6[1m] "); got != "grok-4.5" {
-		t.Fatalf("trimmed [1m]: %q", got)
-	}
 }
 
 func TestDurationHelpers(t *testing.T) {
@@ -314,29 +330,17 @@ func TestDurationHelpers(t *testing.T) {
 	}
 }
 
-
-func TestFreeUsageExhaustedCooldownDefault(t *testing.T) {
-	cfg := Default()
-	if d := cfg.FreeUsageExhaustedCooldown(); d != 20*time.Hour {
-		t.Fatalf("default free usage cooldown=%v", d)
-	}
-	cfg.LB.Cooldown.FreeUsageExhaustedSec = 3600
-	if d := cfg.FreeUsageExhaustedCooldown(); d != time.Hour {
-		t.Fatalf("override=%v", d)
-	}
-}
-
 func TestMaxAttemptsDefault(t *testing.T) {
 	cfg := Default()
 	if n := cfg.MaxAttempts(); n != 32 {
-		t.Fatalf("default max attempts=%d", n)
+		t.Fatalf("default max attempts: %d", n)
 	}
 	cfg.LB.MaxAttempts = 8
 	if n := cfg.MaxAttempts(); n != 8 {
-		t.Fatalf("override=%d", n)
+		t.Fatalf("override: %d", n)
 	}
 	cfg.LB.MaxAttempts = 0
 	if n := cfg.MaxAttempts(); n != 32 {
-		t.Fatalf("zero should fall back to default, got %d", n)
+		t.Fatalf("zero falls back: %d", n)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -15,20 +16,39 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const (
+	maxSSOConverterBatch           = 100
+	maxSSOConverterTimeoutSec      = 300
+	maxInspectionCredentialsPerRun = 1000
+	maxInspectionIntervalSec       = 7 * 24 * 60 * 60
+	maxInspectionTimeoutSec        = 10 * 60
+	maxInspectionPurgeAfterSec     = 365 * 24 * 60 * 60
+	maxInspectionInitialDelaySec   = 24 * 60 * 60
+	maxInspectionSkipRecentSec     = 365 * 24 * 60 * 60
+	maxRequestBodyBytes            = 64 << 20
+	maxRequestTimeoutSec           = 60 * 60
+	maxConcurrentRequests          = 4096
+)
+
 // Config is the root runtime configuration for grokbuild-proxy.
 type Config struct {
-	Listen            string          `yaml:"listen"`
-	DataDir           string          `yaml:"data_dir"`
-	APIKey            string          `yaml:"api_key"`
-	AdminKey          string          `yaml:"admin_key"`
-	AllowPublicListen bool            `yaml:"allow_public_listen"`
-	Upstream          UpstreamConfig  `yaml:"upstream"`
-	OAuth             OAuthConfig     `yaml:"oauth"`
-	ChatBackend       string          `yaml:"chat_backend"`
-	Anthropic         AnthropicConfig `yaml:"anthropic"`
-	LB                LBConfig        `yaml:"lb"`
-	Limits            LimitsConfig    `yaml:"limits"`
-	Logging           LoggingConfig   `yaml:"logging"`
+	Listen            string           `yaml:"listen"`
+	DataDir           string           `yaml:"data_dir"`
+	APIKey            string           `yaml:"api_key"`
+	AdminKey          string           `yaml:"admin_key"`
+	AllowPublicListen bool             `yaml:"allow_public_listen"`
+	AdminTrustedHosts []string         `yaml:"admin_trusted_hosts"`
+	Upstream          UpstreamConfig   `yaml:"upstream"`
+	OAuth             OAuthConfig      `yaml:"oauth"`
+	ChatBackend       string           `yaml:"chat_backend"`
+	Anthropic         AnthropicConfig  `yaml:"anthropic"`
+	LB                LBConfig         `yaml:"lb"`
+	Proxy             ProxyConfig      `yaml:"proxy"`
+	SSOConverter      SSOConfig        `yaml:"sso_converter"`
+	Inspection        InspectionConfig `yaml:"inspection"`
+	Import            ImportConfig     `yaml:"import"`
+	Limits            LimitsConfig     `yaml:"limits"`
+	Logging           LoggingConfig    `yaml:"logging"`
 }
 
 // UpstreamConfig controls how requests are sent to cli-chat-proxy.grok.com.
@@ -57,7 +77,7 @@ type AnthropicConfig struct {
 	CountTokens         bool              `yaml:"count_tokens"`
 	// Context protection / auto-compact (Claude Code long-session support).
 	// SoftInputTokens triggers auto-compact; MaxInputTokens hard-rejects after compact.
-	// Defaults applied when zero: soft=420000, max=480000, tool_result=120000, keep=16.
+	// Defaults applied when zero: soft=400000, max=460000, tool_result=120000, keep=16.
 	AutoCompact        *bool `yaml:"auto_compact"`
 	SoftInputTokens    int   `yaml:"soft_input_tokens"`
 	MaxInputTokens     int   `yaml:"max_input_tokens"`
@@ -76,7 +96,7 @@ type LBConfig struct {
 	Cooldown    CooldownConfig `yaml:"cooldown"`
 	Prefetch    PrefetchConfig `yaml:"prefetch"`
 	// SoftDemoteOn429 temporarily lowers pick preference after 429s (in-memory).
-	// Success clears the demotion. Zero/false keeps default enabled behavior via Defaults.
+	// Success clears the demotion. Nil defaults to enabled.
 	SoftDemoteOn429 *bool `yaml:"soft_demote_on_429"`
 }
 
@@ -95,6 +115,50 @@ type CooldownConfig struct {
 	// FreeUsageExhaustedSec cools accounts after free-usage-exhausted (rolling 24h quota).
 	// 0 uses the default (20h). This is intentionally longer than MaxSec.
 	FreeUsageExhaustedSec int `yaml:"free_usage_exhausted_sec"`
+}
+
+// ProxyConfig controls the default outbound route. Runtime Admin settings can override it.
+type ProxyConfig struct {
+	Mode string `yaml:"mode"`
+	URL  string `yaml:"url"`
+}
+
+// SSOConfig controls the optional SSO-to-OIDC converter service.
+type SSOConfig struct {
+	Enabled           bool   `yaml:"enabled"`
+	Endpoint          string `yaml:"endpoint"`
+	APIKey            string `yaml:"api_key"`
+	AllowInsecureHTTP bool   `yaml:"allow_insecure_http"`
+	TimeoutSec        int    `yaml:"timeout_sec"`
+	MaxBatch          int    `yaml:"max_batch"`
+}
+
+// InspectionConfig controls scheduled credential validation.
+type InspectionConfig struct {
+	Enabled              bool    `yaml:"enabled"`
+	IntervalSec          int     `yaml:"interval_sec"`
+	InitialDelaySec      int     `yaml:"initial_delay_sec"`
+	TimeoutSec           int     `yaml:"timeout_sec"`
+	Concurrency          int     `yaml:"concurrency"`
+	ConfirmUnauthorized  int     `yaml:"confirm_unauthorized"`
+	PurgeAfterSec        int     `yaml:"purge_after_sec"`
+	MassFailureMinimum   int     `yaml:"mass_failure_minimum"`
+	MassFailureRatio     float64 `yaml:"mass_failure_ratio"`
+	SkipRecentSuccessSec int     `yaml:"skip_recent_success_sec"`
+	MaxCredentialsPerRun int     `yaml:"max_credentials_per_run"`
+}
+
+// ImportConfig bounds credential import work independently of normal requests.
+type ImportConfig struct {
+	MaxFiles         int   `yaml:"max_files"`
+	MaxFileBytes     int64 `yaml:"max_file_bytes"`
+	MaxTotalBytes    int64 `yaml:"max_total_bytes"`
+	MaxEntries       int   `yaml:"max_entries"`
+	MaxQueuedJobs    int   `yaml:"max_queued_jobs"`
+	MaxQueuedBytes   int64 `yaml:"max_queued_bytes"`
+	MaxRetainedJobs  int   `yaml:"max_retained_jobs"`
+	MaxRetainedBytes int64 `yaml:"max_retained_bytes"`
+	JobTTLMin        int   `yaml:"job_ttl_min"`
 }
 
 // LimitsConfig enforces request size, timeout and concurrency caps.
@@ -149,12 +213,12 @@ func Default() Config {
 				"haiku":             "grok-composer-2.5-fast",
 			},
 			PassthroughPrefixes: []string{"grok-"},
-			StripUnknownBetas:   true,
-			CountTokens:         true,
-			SoftInputTokens:     400000,
-			MaxInputTokens:      460000,
-			MaxToolResultChars:  120000,
-			KeepRecentMessages:  16,
+			StripUnknownBetas:  true,
+			CountTokens:        true,
+			SoftInputTokens:    400000,
+			MaxInputTokens:     460000,
+			MaxToolResultChars: 120000,
+			KeepRecentMessages: 16,
 		},
 		LB: LBConfig{
 			Strategy:       "priority_rr",
@@ -173,12 +237,37 @@ func Default() Config {
 				Concurrency: 16,
 			},
 		},
+		Proxy: ProxyConfig{Mode: "environment"},
+		SSOConverter: SSOConfig{
+			TimeoutSec: 300,
+			MaxBatch:   50,
+		},
+		Inspection: InspectionConfig{
+			IntervalSec:          3600,
+			InitialDelaySec:      30,
+			TimeoutSec:           30,
+			Concurrency:          2,
+			ConfirmUnauthorized:  2,
+			MassFailureMinimum:   3,
+			MassFailureRatio:     0.5,
+			SkipRecentSuccessSec: 900,
+			MaxCredentialsPerRun: 100,
+		},
+		Import: ImportConfig{
+			MaxFiles:         100,
+			MaxFileBytes:     4 * 1024 * 1024,
+			MaxTotalBytes:    16 * 1024 * 1024,
+			MaxEntries:       1000,
+			MaxQueuedJobs:    32,
+			MaxQueuedBytes:   64 * 1024 * 1024,
+			MaxRetainedJobs:  128,
+			MaxRetainedBytes: 64 * 1024 * 1024,
+			JobTTLMin:        30,
+		},
 		Limits: LimitsConfig{
 			MaxBodyBytes:      20 * 1024 * 1024,
 			RequestTimeoutSec: 600,
-			// Sized for multi-thousand concurrent SSE sessions on a single node.
-			// Raise further only after host FD/CPU headroom is confirmed.
-			MaxConcurrent: 2048,
+			MaxConcurrent:     2048,
 		},
 		Logging: LoggingConfig{
 			Level: "info",
@@ -256,9 +345,11 @@ func (c Config) Validate() error {
 	if err != nil || issuer.Scheme != "https" || issuer.Host == "" {
 		return fmt.Errorf("oauth.issuer must be an absolute https URL")
 	}
-	issuerHost := strings.ToLower(issuer.Hostname())
-	if issuerHost != "x.ai" && !strings.HasSuffix(issuerHost, ".x.ai") {
-		return fmt.Errorf("oauth.issuer host must be x.ai")
+	issuerHost := strings.ToLower(strings.TrimSuffix(issuer.Hostname(), "."))
+	if issuerHost != "auth.x.ai" || (issuer.Port() != "" && issuer.Port() != "443") ||
+		issuer.User != nil || strings.TrimRight(issuer.EscapedPath(), "/") != "" ||
+		issuer.RawQuery != "" || issuer.Fragment != "" {
+		return fmt.Errorf("oauth.issuer must be exactly https://auth.x.ai")
 	}
 	if c.LB.Strategy != "priority_rr" && c.LB.Strategy != "round_robin" {
 		return fmt.Errorf("lb.strategy must be priority_rr or round_robin, got %q", c.LB.Strategy)
@@ -275,6 +366,75 @@ func (c Config) Validate() error {
 	if c.LB.Cooldown.MaxSec > 0 && c.LB.Cooldown.BaseSec > c.LB.Cooldown.MaxSec {
 		return fmt.Errorf("lb.cooldown.base_sec must be <= max_sec")
 	}
+	switch strings.ToLower(strings.TrimSpace(c.Proxy.Mode)) {
+	case "environment", "direct", "url":
+	default:
+		return fmt.Errorf("proxy.mode must be environment, direct, or url")
+	}
+	if strings.EqualFold(strings.TrimSpace(c.Proxy.Mode), "url") && strings.TrimSpace(c.Proxy.URL) == "" {
+		return fmt.Errorf("proxy.url is required when proxy.mode is url")
+	}
+	if c.SSOConverter.TimeoutSec <= 0 || c.SSOConverter.MaxBatch <= 0 {
+		return fmt.Errorf("sso_converter timeout_sec/max_batch must be > 0")
+	}
+	if c.SSOConverter.TimeoutSec > maxSSOConverterTimeoutSec {
+		return fmt.Errorf("sso_converter.timeout_sec must be <= %d", maxSSOConverterTimeoutSec)
+	}
+	if c.SSOConverter.MaxBatch > maxSSOConverterBatch {
+		return fmt.Errorf("sso_converter.max_batch must be <= %d", maxSSOConverterBatch)
+	}
+	if c.SSOConverter.Enabled && strings.TrimSpace(c.SSOConverter.Endpoint) == "" {
+		return fmt.Errorf("sso_converter.endpoint is required when enabled")
+	}
+	if c.Inspection.IntervalSec <= 0 || c.Inspection.TimeoutSec <= 0 ||
+		c.Inspection.Concurrency <= 0 || c.Inspection.ConfirmUnauthorized <= 0 {
+		return fmt.Errorf("inspection interval/timeout/concurrency/confirm values must be > 0")
+	}
+	if c.Inspection.PurgeAfterSec < 0 || c.Inspection.MassFailureMinimum <= 0 ||
+		math.IsNaN(c.Inspection.MassFailureRatio) || math.IsInf(c.Inspection.MassFailureRatio, 0) ||
+		c.Inspection.MassFailureRatio <= 0 || c.Inspection.MassFailureRatio > 1 ||
+		c.Inspection.MaxCredentialsPerRun <= 0 ||
+		c.Inspection.MaxCredentialsPerRun > maxInspectionCredentialsPerRun {
+		return fmt.Errorf("inspection purge/mass-failure values are invalid")
+	}
+	if c.Inspection.MassFailureMinimum > c.Inspection.MaxCredentialsPerRun {
+		return fmt.Errorf("inspection.mass_failure_minimum must be <= max_credentials_per_run")
+	}
+	if c.Inspection.IntervalSec > maxInspectionIntervalSec ||
+		c.Inspection.TimeoutSec > maxInspectionTimeoutSec ||
+		c.Inspection.PurgeAfterSec > maxInspectionPurgeAfterSec ||
+		c.Inspection.InitialDelaySec > maxInspectionInitialDelaySec ||
+		c.Inspection.SkipRecentSuccessSec > maxInspectionSkipRecentSec {
+		return fmt.Errorf("inspection duration exceeds its safety limit")
+	}
+	if c.Import.MaxFiles <= 0 || c.Import.MaxFileBytes <= 0 || c.Import.MaxTotalBytes <= 0 ||
+		c.Import.MaxEntries <= 0 || c.Import.MaxQueuedJobs <= 0 || c.Import.MaxQueuedBytes <= 0 ||
+		c.Import.MaxRetainedJobs <= 0 || c.Import.MaxRetainedBytes <= 0 || c.Import.JobTTLMin <= 0 {
+		return fmt.Errorf("import limits must be > 0")
+	}
+	if c.Limits.MaxBodyBytes <= 0 {
+		return fmt.Errorf("limits.max_body_bytes must be > 0")
+	}
+	if c.Limits.MaxBodyBytes > maxRequestBodyBytes {
+		return fmt.Errorf("limits.max_body_bytes must be <= %d", maxRequestBodyBytes)
+	}
+	if c.Limits.RequestTimeoutSec <= 0 {
+		return fmt.Errorf("limits.request_timeout_sec must be > 0")
+	}
+	if c.Limits.RequestTimeoutSec > maxRequestTimeoutSec {
+		return fmt.Errorf("limits.request_timeout_sec must be <= %d", maxRequestTimeoutSec)
+	}
+	if c.Limits.MaxConcurrent <= 0 {
+		return fmt.Errorf("limits.max_concurrent must be > 0")
+	}
+	if c.Limits.MaxConcurrent > maxConcurrentRequests {
+		return fmt.Errorf("limits.max_concurrent must be <= %d", maxConcurrentRequests)
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Logging.Level)) {
+	case "debug", "info", "warn", "warning", "error":
+	default:
+		return fmt.Errorf("logging.level must be debug, info, warn, or error")
+	}
 	if c.LB.Cooldown.FreeUsageExhaustedSec < 0 {
 		return fmt.Errorf("lb.cooldown.free_usage_exhausted_sec must be >= 0")
 	}
@@ -290,15 +450,6 @@ func (c Config) Validate() error {
 	if c.LB.Prefetch.Concurrency < 0 {
 		return fmt.Errorf("lb.prefetch.concurrency must be >= 0")
 	}
-	if c.Limits.MaxBodyBytes <= 0 {
-		return fmt.Errorf("limits.max_body_bytes must be > 0")
-	}
-	if c.Limits.RequestTimeoutSec <= 0 {
-		return fmt.Errorf("limits.request_timeout_sec must be > 0")
-	}
-	if c.Limits.MaxConcurrent <= 0 {
-		return fmt.Errorf("limits.max_concurrent must be > 0")
-	}
 	if c.Anthropic.SoftInputTokens < 0 || c.Anthropic.MaxInputTokens < 0 {
 		return fmt.Errorf("anthropic soft/max input tokens must be >= 0")
 	}
@@ -308,10 +459,10 @@ func (c Config) Validate() error {
 	if c.Anthropic.MaxToolResultChars < 0 || c.Anthropic.KeepRecentMessages < 0 {
 		return fmt.Errorf("anthropic max_tool_result_chars/keep_recent_messages must be >= 0")
 	}
-	switch strings.ToLower(strings.TrimSpace(c.Logging.Level)) {
-	case "debug", "info", "warn", "warning", "error":
-	default:
-		return fmt.Errorf("logging.level must be debug, info, warn, or error")
+	for _, host := range c.AdminTrustedHosts {
+		if _, err := NormalizeTrustedHost(host); err != nil {
+			return fmt.Errorf("admin_trusted_hosts: %w", err)
+		}
 	}
 	return c.ValidateListen(c.Listen)
 }
@@ -363,6 +514,44 @@ func IsPublicListen(addr string) bool {
 	return ip == nil || !ip.IsLoopback()
 }
 
+// NormalizeTrustedHost canonicalizes an HTTP Host allowlist entry. Ports are
+// accepted but deliberately ignored so one host remains trusted when the
+// listener is published through a different local/reverse-proxy port.
+func NormalizeTrustedHost(raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" || strings.ContainsAny(value, "\r\n\x00") {
+		return "", fmt.Errorf("trusted host is empty or contains control characters")
+	}
+	if strings.Contains(value, "://") || strings.ContainsAny(value, "/\\@?#") {
+		return "", fmt.Errorf("trusted host %q must be a hostname or IP address, not a URL", raw)
+	}
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		value = host
+	} else if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
+		value = strings.TrimSuffix(strings.TrimPrefix(value, "["), "]")
+	} else if strings.Contains(value, ":") && net.ParseIP(value) == nil {
+		return "", fmt.Errorf("trusted host %q has an invalid port or IPv6 form", raw)
+	}
+	value = strings.ToLower(strings.TrimSuffix(strings.Trim(value, "[]"), "."))
+	if value == "" || value == "0.0.0.0" || value == "::" || strings.Contains(value, "*") {
+		return "", fmt.Errorf("trusted host %q must be an exact non-wildcard host", raw)
+	}
+	if ip := net.ParseIP(value); ip != nil {
+		return ip.String(), nil
+	}
+	for _, label := range strings.Split(value, ".") {
+		if label == "" || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return "", fmt.Errorf("trusted host %q is invalid", raw)
+		}
+		for _, char := range label {
+			if (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '-' {
+				return "", fmt.Errorf("trusted host %q is invalid", raw)
+			}
+		}
+	}
+	return value, nil
+}
+
 // StickyTTL returns sticky session TTL as a duration.
 func (c Config) StickyTTL() time.Duration {
 	return time.Duration(c.LB.StickyTTLSec) * time.Second
@@ -383,11 +572,6 @@ func (c Config) ResolveModel(model string) string {
 // ResolveModel maps an Anthropic model id using explicit aliases only.
 // Unknown future model ids are not guessed because their capabilities may
 // differ from the configured target.
-//
-// Claude Code appends a literal "[1m]" suffix to model ids when the user
-// selects 1M context. That suffix only changes the client's local window
-// budget; strip it before alias lookup / passthrough so upstream receives a
-// real model id.
 func (c AnthropicConfig) ResolveModel(model string) string {
 	model = strings.TrimSpace(model)
 	if model == "" {
@@ -500,7 +684,6 @@ func (c AnthropicConfig) EffectiveSoftInputTokens() int {
 		return c.SoftInputTokens
 	}
 	if c.MaxInputTokens > 0 {
-		// soft at 90% of hard limit when only hard is set
 		return c.MaxInputTokens * 9 / 10
 	}
 	return 400000
