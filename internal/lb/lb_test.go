@@ -518,7 +518,6 @@ func TestPersistedHealthCannotReorderFailureAfterSuccess(t *testing.T) {
 	}
 }
 
-
 func TestCooldownDuration_ExplicitRetryAfterNoJitter(t *testing.T) {
 	s := New(testCfg("priority_rr"))
 	// Explicit Retry-After / free-usage windows must be exact across many draws.

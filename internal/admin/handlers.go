@@ -263,7 +263,6 @@ func subtleConstantTimeEq(a, b string) bool {
 	return v == 0
 }
 
-
 func parsePage(r *http.Request, defaultPage, defaultSize int) (page, pageSize int) {
 	page = defaultPage
 	pageSize = defaultSize

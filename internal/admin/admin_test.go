@@ -303,7 +303,6 @@ func (f *fakeStore) RotateClientKey(id string) (storage.CreateClientResult, erro
 	return storage.CreateClientResult{Client: c, Plaintext: "sk-rotated-plaintext"}, nil
 }
 
-
 type nfErr struct{ kind, id string }
 
 func (e nfErr) Error() string { return "storage: " + e.kind + " " + e.id + " not found" }

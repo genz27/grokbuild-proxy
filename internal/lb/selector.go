@@ -385,7 +385,6 @@ func (s *Selector) ensureState(credID string) *runtimeState {
 	return st
 }
 
-
 // preferFreshAccess reports whether c currently has a non-expired access token.
 func (s *Selector) isDemoted(credID string, now time.Time) bool {
 	if s == nil || !s.softDemoteOn429 || credID == "" {

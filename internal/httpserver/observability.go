@@ -91,9 +91,15 @@ func (m *Metrics) observePoint(status int, elapsed time.Duration, now time.Time)
 	idx := int(minute.Unix()/60) % len(m.buckets)
 	m.mu.Lock()
 	p := &m.buckets[idx]
-	if !p.Time.Equal(minute) { *p = MetricPoint{Time: minute} }
+	if !p.Time.Equal(minute) {
+		*p = MetricPoint{Time: minute}
+	}
 	p.Requests++
-	if status >= 400 { p.Errors++ } else { p.Successes++ }
+	if status >= 400 {
+		p.Errors++
+	} else {
+		p.Successes++
+	}
 	p.DurationMS += float64(elapsed.Microseconds()) / 1000
 	m.mu.Unlock()
 }

@@ -729,7 +729,6 @@ func TestParseRetryAfter(t *testing.T) {
 	}
 }
 
-
 func TestIsFreeUsageExhaustedBody(t *testing.T) {
 	cases := []struct {
 		body string

@@ -55,8 +55,8 @@ func NewClient(cfg Config) *Client {
 		hc = &http.Client{
 			Timeout: 0, // per-request context controls deadlines; streams must not have a client-wide timeout
 			Transport: &http.Transport{
-				Proxy:                 http.ProxyFromEnvironment,
-				ForceAttemptHTTP2:     true,
+				Proxy:             http.ProxyFromEnvironment,
+				ForceAttemptHTTP2: true,
 				// Sized for thousands of concurrent SSE streams against one upstream host.
 				MaxIdleConns:          4096,
 				MaxIdleConnsPerHost:   2048,

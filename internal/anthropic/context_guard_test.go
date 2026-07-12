@@ -10,13 +10,13 @@ func TestAutoCompactDropsOldMessages(t *testing.T) {
 	msgs := make([]map[string]any, 0, 40)
 	for i := 0; i < 40; i++ {
 		msgs = append(msgs, map[string]any{
-			"role": "user",
+			"role":    "user",
 			"content": "message " + strings.Repeat("x", 2000) + " " + string(rune('a'+(i%26))),
 		})
 	}
 	body, _ := json.Marshal(map[string]any{
-		"model": "claude-sonnet-4",
-		"messages": msgs,
+		"model":      "claude-sonnet-4",
+		"messages":   msgs,
 		"max_tokens": 16,
 	})
 	cfg := ContextGuardConfig{
@@ -53,9 +53,9 @@ func TestToolResultTruncate(t *testing.T) {
 		"messages": []map[string]any{{
 			"role": "user",
 			"content": []map[string]any{{
-				"type": "tool_result",
+				"type":        "tool_result",
 				"tool_use_id": "t1",
-				"content": big,
+				"content":     big,
 			}},
 		}},
 	})

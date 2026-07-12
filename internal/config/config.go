@@ -88,11 +88,11 @@ type AnthropicConfig struct {
 
 // LBConfig controls multi-credential selection and sticky sessions.
 type LBConfig struct {
-	Strategy       string         `yaml:"strategy"`
-	StickyTTLSec   int            `yaml:"sticky_ttl_sec"`
-	RefreshSkewSec int            `yaml:"refresh_skew_sec"`
+	Strategy       string `yaml:"strategy"`
+	StickyTTLSec   int    `yaml:"sticky_ttl_sec"`
+	RefreshSkewSec int    `yaml:"refresh_skew_sec"`
 	// MaxAttempts caps credential failover per request (0 = package default).
-	MaxAttempts int `yaml:"max_attempts"`
+	MaxAttempts int            `yaml:"max_attempts"`
 	Cooldown    CooldownConfig `yaml:"cooldown"`
 	Prefetch    PrefetchConfig `yaml:"prefetch"`
 	// SoftDemoteOn429 temporarily lowers pick preference after 429s (in-memory).
@@ -213,12 +213,12 @@ func Default() Config {
 				"haiku":             "grok-composer-2.5-fast",
 			},
 			PassthroughPrefixes: []string{"grok-"},
-			StripUnknownBetas:  true,
-			CountTokens:        true,
-			SoftInputTokens:    400000,
-			MaxInputTokens:     460000,
-			MaxToolResultChars: 120000,
-			KeepRecentMessages: 16,
+			StripUnknownBetas:   true,
+			CountTokens:         true,
+			SoftInputTokens:     400000,
+			MaxInputTokens:      460000,
+			MaxToolResultChars:  120000,
+			KeepRecentMessages:  16,
 		},
 		LB: LBConfig{
 			Strategy:       "priority_rr",
