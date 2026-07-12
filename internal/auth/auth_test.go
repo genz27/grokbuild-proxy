@@ -116,6 +116,70 @@ func TestParseGrokAuthJSON_SourceKeyFallback(t *testing.T) {
 	}
 }
 
+func TestParseGrokAuthJSON_AccessTokenShape(t *testing.T) {
+	raw := `{
+  "access_token": "at-1",
+  "refresh_token": "rt-1",
+  "email": "clip@example.com",
+  "sub": "user-1",
+  "expired": "2026-07-11T08:35:42Z",
+  "client_id": "b1a00492-073a-47ea-816f-4c329264a828"
+}`
+	creds, err := ParseGrokAuthJSON([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(creds) != 1 {
+		t.Fatalf("want 1, got %d", len(creds))
+	}
+	c := creds[0]
+	if c.AccessToken != "at-1" || c.RefreshToken != "rt-1" {
+		t.Fatalf("tokens: %+v", c)
+	}
+	if c.Email != "clip@example.com" || c.UserID != "user-1" {
+		t.Fatalf("identity: %+v", c)
+	}
+	if c.ExpiresAt.IsZero() {
+		t.Fatal("expires missing")
+	}
+}
+
+func TestParseGrokAuthJSON_NestedTokenAndArray(t *testing.T) {
+	raw := `{
+  "token": {
+    "access_token": "nested-at",
+    "refresh_token": "nested-rt",
+    "expires_at": 1783758942
+  },
+  "userinfo": {"email": "nested@example.com", "sub": "nested-user"}
+}`
+	creds, err := ParseGrokAuthJSON([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(creds) != 1 || creds[0].AccessToken != "nested-at" {
+		t.Fatalf("%+v", creds)
+	}
+	if creds[0].Email != "nested@example.com" {
+		t.Fatalf("email=%q", creds[0].Email)
+	}
+
+	arr := `[
+  {"oauth_access_token":"a1","oauth_refresh_token":"r1","email":"a@x.ai"},
+  {"oauth_access_token":"a2","oauth_refresh_token":"r2","email":"b@x.ai"}
+]`
+	creds, err = ParseGrokAuthJSON([]byte(arr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(creds) != 2 {
+		t.Fatalf("want 2, got %d", len(creds))
+	}
+	if creds[0].AccessToken != "a1" || creds[1].RefreshToken != "r2" {
+		t.Fatalf("%+v", creds)
+	}
+}
+
 func TestImportGrokAuthFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "auth.json")

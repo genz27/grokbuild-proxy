@@ -22,7 +22,9 @@ import (
 )
 
 // DefaultMaxAttempts is the max number of credential picks for a single Post.
-const DefaultMaxAttempts = 3
+// High enough to walk a free-tier pool past exhausted accounts without
+// surfacing 429 to clients when other credentials remain healthy.
+const DefaultMaxAttempts = 32
 
 // ErrUpgradeRequired is returned when upstream responds 426 (protocol upgrade required).
 var ErrUpgradeRequired = errors.New("proxy: upstream requires protocol upgrade (426)")
@@ -58,13 +60,22 @@ type TokenRefresher interface {
 }
 
 // Executor selects credentials, refreshes tokens, and posts to upstream /v1/responses.
+type usageQueue interface {
+	EnqueueLastUsed(id string, at time.Time)
+}
+
 type Executor struct {
 	Store     Store
 	Selector  Selector
 	Upstream  Upstream
 	Refresher TokenRefresher
+	// UsageQueue optionally defers last_used_at writes.
+	UsageQueue usageQueue
 	// MaxAttempts caps credential failover. Zero uses DefaultMaxAttempts.
 	MaxAttempts int
+	// FreeUsageExhaustedCooldown is applied when upstream reports free quota
+	// exhaustion (rolling ~24h window). Zero uses 20h.
+	FreeUsageExhaustedCooldown time.Duration
 	// Now is optional clock injection for tests.
 	Now func() time.Time
 	// Logger receives credential-selection outcomes without request bodies/tokens.
@@ -74,6 +85,7 @@ type Executor struct {
 
 	usageMu  sync.Mutex
 	lastUsed map[string]time.Time
+	path     pathCounters
 }
 
 // Post implements openai.PostResponsesFunc / anthropic.PostResponsesFunc.
@@ -101,16 +113,22 @@ func (e *Executor) Post(ctx context.Context, model, convID string, body []byte, 
 	var lastErr error
 	var lastResp *http.Response
 	idempotencyKey := newIdempotencyKey()
+	postStart := time.Now()
+	listStart := time.Now()
+	creds, err := e.Store.ListCredentials()
+	e.observeList(time.Since(listStart))
+	if err != nil {
+		return nil, fmt.Errorf("proxy: list credentials: %w", err)
+	}
+	if maxAttempts > len(creds) {
+		maxAttempts = len(creds)
+	}
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 
-		creds, err := e.Store.ListCredentials()
-		if err != nil {
-			return nil, fmt.Errorf("proxy: list credentials: %w", err)
-		}
 		// Exclude already-tried credentials from this request.
 		filtered := make([]storage.Credential, 0, len(creds))
 		for _, c := range creds {
@@ -121,7 +139,9 @@ func (e *Executor) Post(ctx context.Context, model, convID string, body []byte, 
 		}
 
 		now := e.now()
+		pickStart := time.Now()
 		cred, err := e.Selector.Pick(filtered, convID, now)
+		e.observePick(time.Since(pickStart))
 		if err != nil {
 			if lastResp != nil {
 				return lastResp, nil
@@ -137,7 +157,12 @@ func (e *Executor) Post(ctx context.Context, model, convID string, body []byte, 
 			"attempt", attempt+1,
 		)
 
+		tokenStart := time.Now()
+		prevAccess := strings.TrimSpace(cred.AccessToken)
+		prevRefresh := strings.TrimSpace(cred.RefreshToken)
+		prevExp := cred.ExpiresAt
 		tokens, err := e.EnsureToken(ctx, cred)
+		e.observeRefresh(err == nil, time.Since(tokenStart))
 		if err != nil {
 			lastErr = err
 			e.log(ctx, slog.LevelWarn, "credential_token_failed",
@@ -157,9 +182,15 @@ func (e *Executor) Post(ctx context.Context, model, convID string, body []byte, 
 			e.Selector.MarkFailure(cred.ID, http.StatusUnauthorized, 0, e.now())
 			continue
 		}
-		// Reload after possible token persist so subsequent updates keep latest fields.
-		if latest, gerr := e.Store.GetCredential(cred.ID); gerr == nil {
-			cred = latest
+		// Apply token fields from EnsureToken result. Only hit storage again when
+		// a refresh rotated material (avoids GetCredential on the hot path).
+		refreshed := strings.TrimSpace(tokens.AccessToken) != prevAccess ||
+			(strings.TrimSpace(tokens.RefreshToken) != "" && strings.TrimSpace(tokens.RefreshToken) != prevRefresh) ||
+			(!tokens.ExpiresAt.IsZero() && !tokens.ExpiresAt.Equal(prevExp))
+		if refreshed {
+			if latest, gerr := e.Store.GetCredential(cred.ID); gerr == nil {
+				cred = latest
+			}
 		}
 		cred.AccessToken = tokens.AccessToken
 		if tokens.RefreshToken != "" {
@@ -169,6 +200,7 @@ func (e *Executor) Post(ctx context.Context, model, convID string, body []byte, 
 			cred.ExpiresAt = tokens.ExpiresAt
 		}
 
+		upStart := time.Now()
 		resp, err := e.Upstream.PostResponses(ctx, body, upstream.PostResponsesOptions{
 			AccessToken:  tokens.AccessToken,
 			Model:        model,
@@ -176,6 +208,7 @@ func (e *Executor) Post(ctx context.Context, model, convID string, body []byte, 
 			Stream:       stream,
 			ExtraHeaders: idempotencyHeaders(idempotencyKey),
 		})
+		e.observeUpstream(time.Since(upStart))
 		if err != nil {
 			lastErr = err
 			e.log(ctx, slog.LevelWarn, "upstream_request_failed",
@@ -194,10 +227,12 @@ func (e *Executor) Post(ctx context.Context, model, convID string, body []byte, 
 
 		// Success path.
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			e.observeTTFT(time.Since(postStart))
 			e.log(ctx, slog.LevelDebug, "upstream_request_succeeded",
 				"credential_id", cred.ID,
 				"attempt", attempt+1,
 				"upstream_status", resp.StatusCode,
+				"ttft_ms", float64(time.Since(postStart).Microseconds())/1000,
 			)
 			e.Selector.MarkSuccess(cred.ID, convID, e.now())
 			_ = e.touchLastUsed(cred)
@@ -238,30 +273,46 @@ func (e *Executor) Post(ctx context.Context, model, convID string, body []byte, 
 			ra := parseRetryAfterAt(retry.Header.Get("Retry-After"), e.now())
 			status := retry.StatusCode
 			lastResp = bufferErrorResponse(retry)
+			freeExhausted := isFreeUsageExhaustedResponse(lastResp)
+			if freeExhausted {
+				if freeCD := e.freeUsageExhaustedDuration(); freeCD > ra {
+					ra = freeCD
+				}
+			}
 			e.Selector.MarkFailure(cred.ID, status, ra, e.now())
 			e.log(ctx, slog.LevelWarn, "upstream_retryable_status",
 				"credential_id", cred.ID,
 				"attempt", attempt+1,
 				"upstream_status", status,
 				"retry_after_ms", ra.Milliseconds(),
+				"free_usage_exhausted", freeExhausted,
 			)
 			lastErr = fmt.Errorf("proxy: upstream status %d after refresh", status)
+			e.observeFailover()
 			continue
 		}
 
-		// Retryable statuses before body delivery: 429 / 5xx / 403.
+		// Retryable statuses before body delivery: 429 / 5xx / 403 / 402.
 		if isRetryableStatus(resp.StatusCode) {
 			ra := parseRetryAfterAt(resp.Header.Get("Retry-After"), e.now())
 			status := resp.StatusCode
 			lastResp = bufferErrorResponse(resp)
+			freeExhausted := isFreeUsageExhaustedResponse(lastResp)
+			if freeExhausted {
+				if freeCD := e.freeUsageExhaustedDuration(); freeCD > ra {
+					ra = freeCD
+				}
+			}
 			e.Selector.MarkFailure(cred.ID, status, ra, e.now())
 			e.log(ctx, slog.LevelWarn, "upstream_retryable_status",
 				"credential_id", cred.ID,
 				"attempt", attempt+1,
 				"upstream_status", status,
 				"retry_after_ms", ra.Milliseconds(),
+				"free_usage_exhausted", freeExhausted,
 			)
 			lastErr = fmt.Errorf("proxy: upstream status %d", status)
+			e.observeFailover()
 			continue
 		}
 
@@ -311,12 +362,24 @@ func (e *Executor) EnsureTokenByID(ctx context.Context, credID string) (auth.Tok
 	if err != nil {
 		return auth.TokenSet{}, storage.Credential{}, err
 	}
+	prevAccess := strings.TrimSpace(cred.AccessToken)
+	prevRefresh := strings.TrimSpace(cred.RefreshToken)
 	ts, err := e.EnsureToken(ctx, cred)
 	if err != nil {
 		return auth.TokenSet{}, cred, err
 	}
-	if latest, gerr := e.Store.GetCredential(credID); gerr == nil {
-		cred = latest
+	if strings.TrimSpace(ts.AccessToken) != prevAccess ||
+		(strings.TrimSpace(ts.RefreshToken) != "" && strings.TrimSpace(ts.RefreshToken) != prevRefresh) {
+		if latest, gerr := e.Store.GetCredential(credID); gerr == nil {
+			cred = latest
+		}
+	}
+	cred.AccessToken = ts.AccessToken
+	if ts.RefreshToken != "" {
+		cred.RefreshToken = ts.RefreshToken
+	}
+	if !ts.ExpiresAt.IsZero() {
+		cred.ExpiresAt = ts.ExpiresAt
 	}
 	return ts, cred, nil
 }
@@ -432,7 +495,11 @@ func (e *Executor) touchLastUsed(cred storage.Credential) error {
 	}
 	e.lastUsed[cred.ID] = now
 	e.usageMu.Unlock()
-	// Only mutate LastUsedAt under the store lock so concurrent token rotates cannot be clobbered.
+	if e.UsageQueue != nil {
+		e.UsageQueue.EnqueueLastUsed(cred.ID, now)
+		return nil
+	}
+	// Fallback immediate patch.
 	_, err := e.Store.PatchCredential(cred.ID, func(c *storage.Credential) error {
 		c.LastUsedAt = &now
 		return nil
@@ -528,6 +595,49 @@ func bufferErrorResponse(resp *http.Response) *http.Response {
 	clone.Body = io.NopCloser(strings.NewReader(string(raw)))
 	clone.ContentLength = int64(len(raw))
 	return clone
+}
+
+
+func (e *Executor) freeUsageExhaustedDuration() time.Duration {
+	if e != nil && e.FreeUsageExhaustedCooldown > 0 {
+		return e.FreeUsageExhaustedCooldown
+	}
+	return 20 * time.Hour
+}
+
+// isFreeUsageExhaustedResponse reports whether an upstream error body indicates
+// free-tier quota exhaustion (rolling ~24h window), not a short rate limit.
+func isFreeUsageExhaustedResponse(resp *http.Response) bool {
+	if resp == nil || resp.Body == nil {
+		return false
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil && len(raw) == 0 {
+		return false
+	}
+	resp.Body = io.NopCloser(strings.NewReader(string(raw)))
+	resp.ContentLength = int64(len(raw))
+	return isFreeUsageExhaustedBody(string(raw))
+}
+
+func isFreeUsageExhaustedBody(body string) bool {
+	lower := strings.ToLower(body)
+	// Prefer explicit free-usage markers; avoid matching short rate-limit 429s.
+	markers := []string{
+		"free_usage_exhausted",
+		"free usage exhausted",
+		"free-usage-exhausted",
+		"free_tier_usage_exhausted",
+		"free tier usage exhausted",
+		"included free usage",
+		"subscription:free-usage-exhausted",
+	}
+	for _, m := range markers {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // DrainAndClose is a helper for callers that abandon a response.

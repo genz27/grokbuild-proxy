@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,10 +33,17 @@ type Store interface {
 	ListClients() ([]storage.ClientKey, error)
 	CreateClient(name string) (storage.CreateClientResult, error)
 	DeleteClient(id string) error
+	GetBootstrapKeys() (apiKey, adminKey string, err error)
+	SetAdminKey(newKey string) (adminKey string, generated bool, err error)
+	RotateClientKey(id string) (storage.CreateClientResult, error)
 }
 
 type credentialUpserter interface {
 	UpsertCredential(in storage.CreateCredentialInput) (storage.Credential, bool, error)
+}
+
+type credentialBatchUpserter interface {
+	UpsertCredentials(inputs []storage.CreateCredentialInput) ([]storage.UpsertCredentialResult, error)
 }
 
 // TokenService refreshes credentials and fetches billing.
@@ -56,6 +64,7 @@ type Handlers struct {
 	Version string
 	// MaxBody limits JSON body size.
 	MaxBody int64
+	Metrics func() any
 
 	deviceMu       sync.Mutex
 	deviceSessions map[string]deviceSession
@@ -132,6 +141,15 @@ func (h *Handlers) maxBody() int64 {
 	return 1 << 20
 }
 
+// importMaxBody allows larger bulk credential pastes while keeping other admin bodies smaller.
+func (h *Handlers) importMaxBody() int64 {
+	const floor int64 = 16 << 20 // 16 MiB
+	if m := h.maxBody(); m > floor {
+		return m
+	}
+	return floor
+}
+
 func (h *Handlers) version() string {
 	if h != nil && h.Version != "" {
 		return h.Version
@@ -188,11 +206,41 @@ func (h *Handlers) ListCredentials(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	out := make([]maskedCredential, 0, len(creds))
-	for _, c := range creds {
+	page := positiveQueryInt(r, "page", 1)
+	pageSize := positiveQueryInt(r, "page_size", 20)
+	if pageSize > 100 {
+		pageSize = 100
+	}
+	total := len(creds)
+	totalPages := (total + pageSize - 1) / pageSize
+	if totalPages > 0 && page > totalPages {
+		page = totalPages
+	}
+	start := (page - 1) * pageSize
+	if start > total {
+		start = total
+	}
+	end := min(start+pageSize, total)
+	out := make([]maskedCredential, 0, end-start)
+	for _, c := range creds[start:end] {
 		out = append(out, maskCredential(c))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"credentials": out})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"credentials": out,
+		"pool":        summarizePool(creds, time.Now()),
+		"page":        page,
+		"page_size":   pageSize,
+		"total":       total,
+		"total_pages": totalPages,
+	})
+}
+
+func positiveQueryInt(r *http.Request, name string, fallback int) int {
+	value, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get(name)))
+	if err != nil || value < 1 {
+		return fallback
+	}
+	return value
 }
 
 // CreateCredential POST /admin/credentials
@@ -249,7 +297,7 @@ func (h *Handlers) ImportGrok(w http.ResponseWriter, r *http.Request) {
 		Raw  json.RawMessage `json:"raw"`
 	}
 	// Body is optional; empty body → default path. Malformed JSON is 400 (not silent fallback).
-	if err := decodeJSON(r, h.maxBody(), &body); err != nil {
+	if err := decodeJSON(r, h.importMaxBody(), &body); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -257,7 +305,12 @@ func (h *Handlers) ImportGrok(w http.ResponseWriter, r *http.Request) {
 	var imported []auth.ImportedCredential
 	var err error
 	if len(body.Raw) > 0 {
-		imported, err = auth.ParseGrokAuthJSON(body.Raw)
+		raw := body.Raw
+		var asString string
+		if err := json.Unmarshal(raw, &asString); err == nil {
+			raw = json.RawMessage(asString)
+		}
+		imported, err = auth.ParseGrokAuthJSON(raw)
 	} else {
 		path := strings.TrimSpace(body.Path)
 		var extraRoots []string
@@ -276,13 +329,16 @@ func (h *Handlers) ImportGrok(w http.ResponseWriter, r *http.Request) {
 	createdCount := 0
 	updatedCount := 0
 	failedCount := 0
-	upserter, canUpsert := h.Store.(credentialUpserter)
+	inputs := make([]storage.CreateCredentialInput, 0, len(imported))
 	for _, ic := range imported {
 		name := ic.Email
 		if name == "" {
+			name = ic.UserID
+		}
+		if name == "" {
 			name = ic.SourceKey
 		}
-		input := storage.CreateCredentialInput{
+		inputs = append(inputs, storage.CreateCredentialInput{
 			Name:         name,
 			Email:        ic.Email,
 			UserID:       ic.UserID,
@@ -292,40 +348,62 @@ func (h *Handlers) ImportGrok(w http.ResponseWriter, r *http.Request) {
 			AccessToken:  ic.AccessToken,
 			RefreshToken: ic.RefreshToken,
 			ExpiresAt:    ic.ExpiresAt,
-		}
-		var c storage.Credential
-		var wasCreated bool
-		var cerr error
-		if canUpsert {
-			c, wasCreated, cerr = upserter.UpsertCredential(input)
-		} else {
-			c, cerr = h.Store.CreateCredential(input)
-			wasCreated = cerr == nil
-		}
-		if cerr != nil {
-			failedCount++
-			results = append(results, map[string]any{
-				"source_key": ic.SourceKey,
-				"status":     "failed",
-				"error":      cerr.Error(),
-			})
-			continue
-		}
-		if wasCreated {
-			createdCount++
-		} else {
-			updatedCount++
-		}
-		status := "updated"
-		if wasCreated {
-			status = "created"
-		}
-		results = append(results, map[string]any{
-			"source_key": ic.SourceKey,
-			"status":     status,
-			"id":         c.ID,
 		})
-		credentials = append(credentials, maskCredential(c))
+	}
+	if batch, ok := h.Store.(credentialBatchUpserter); ok {
+		batchResults, batchErr := batch.UpsertCredentials(inputs)
+		if batchErr != nil {
+			writeErr(w, http.StatusBadRequest, batchErr.Error())
+			return
+		}
+		for i, item := range batchResults {
+			status := "updated"
+			if item.Created {
+				status = "created"
+				createdCount++
+			} else {
+				updatedCount++
+			}
+			results = append(results, map[string]any{"source_key": imported[i].SourceKey, "status": status, "id": item.Credential.ID})
+			credentials = append(credentials, maskCredential(item.Credential))
+		}
+	} else {
+		upserter, canUpsert := h.Store.(credentialUpserter)
+		for i, input := range inputs {
+			var c storage.Credential
+			var wasCreated bool
+			var cerr error
+			if canUpsert {
+				c, wasCreated, cerr = upserter.UpsertCredential(input)
+			} else {
+				c, cerr = h.Store.CreateCredential(input)
+				wasCreated = cerr == nil
+			}
+			if cerr != nil {
+				failedCount++
+				results = append(results, map[string]any{
+					"source_key": imported[i].SourceKey,
+					"status":     "failed",
+					"error":      cerr.Error(),
+				})
+				continue
+			}
+			if wasCreated {
+				createdCount++
+			} else {
+				updatedCount++
+			}
+			status := "updated"
+			if wasCreated {
+				status = "created"
+			}
+			results = append(results, map[string]any{
+				"source_key": imported[i].SourceKey,
+				"status":     status,
+				"id":         c.ID,
+			})
+			credentials = append(credentials, maskCredential(c))
+		}
 	}
 	status := http.StatusOK
 	if createdCount > 0 {
@@ -465,6 +543,74 @@ func (h *Handlers) DeleteClient(w http.ResponseWriter, r *http.Request, id strin
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
 }
 
+// GetAdminKey GET /admin/secrets/admin-key
+func (h *Handlers) GetAdminKey(w http.ResponseWriter, r *http.Request) {
+	_, adminKey, err := h.Store.GetBootstrapKeys()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Prefer live process admin key when available.
+	live := strings.TrimSpace(h.AdminKey)
+	if live != "" {
+		adminKey = live
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"admin_key": adminKey,
+		"prefix":    maskSecret(adminKey),
+		"source":    "process",
+	})
+}
+
+// SetAdminKey PUT /admin/secrets/admin-key
+// Body: {"admin_key":"..."} or {"rotate":true}
+func (h *Handlers) SetAdminKey(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		AdminKey string `json:"admin_key"`
+		Rotate   bool   `json:"rotate"`
+	}
+	if err := decodeJSON(r, h.maxBody(), &body); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	newKey := strings.TrimSpace(body.AdminKey)
+	if body.Rotate {
+		newKey = ""
+	}
+	if newKey == "" && !body.Rotate {
+		writeErr(w, http.StatusBadRequest, "admin_key required (or set rotate=true)")
+		return
+	}
+	adminKey, generated, err := h.Store.SetAdminKey(newKey)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Hot-reload process admin key so subsequent requests use the new secret.
+	h.AdminKey = adminKey
+	writeJSON(w, http.StatusOK, map[string]any{
+		"admin_key": adminKey,
+		"generated": generated,
+		"prefix":    maskSecret(adminKey),
+		"note":      "admin key updated in meta.json and current process; restart still loads the same key from meta",
+	})
+}
+
+// RotateClient POST /admin/clients/{id}/rotate
+func (h *Handlers) RotateClient(w http.ResponseWriter, r *http.Request, id string) {
+	res, err := h.Store.RotateClientKey(id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"client":    res.Client,
+		"plaintext": res.Plaintext,
+		"api_key":   res.Plaintext,
+		"note":      "plaintext shown once; store it now",
+	})
+}
+
 // System GET /admin/system
 func (h *Handlers) System(w http.ResponseWriter, r *http.Request) {
 	credentials, err := h.Store.ListCredentials()
@@ -472,7 +618,7 @@ func (h *Handlers) System(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "credential store unavailable")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"version": h.version(),
 		"listen":  h.Config.Listen,
 		"upstream": map[string]any{
@@ -489,7 +635,13 @@ func (h *Handlers) System(w http.ResponseWriter, r *http.Request) {
 		},
 		"limits": h.Config.Limits,
 		"pool":   summarizePool(credentials, time.Now()),
-	})
+	}
+	if h.Metrics != nil {
+		if snap := h.Metrics(); snap != nil {
+			out["metrics"] = snap
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func decodeJSON(r *http.Request, max int64, dest any) error {

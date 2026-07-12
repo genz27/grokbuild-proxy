@@ -25,6 +25,16 @@ type Store struct {
 
 	mu   sync.Mutex
 	lock *os.File
+
+	// credCache holds a sorted snapshot for ListCredentials hot path.
+	// Rebuilt on every credentials write under withLock.
+	credCache      []Credential
+	credCacheValid bool
+
+	// clientByHash is an O(1) lookup for client API keys (hash → record).
+	// Rebuilt on every clients write under withLock.
+	clientByHash   map[string]ClientKey
+	clientCacheValid bool
 }
 
 // New creates a Store rooted at dir. The directory is created with mode 0700.

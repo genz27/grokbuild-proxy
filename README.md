@@ -133,6 +133,29 @@ claude --effort high
 export ANTHROPIC_MODEL=claude-sonnet-5
 ```
 
+### Claude Code 1M 上下文
+
+Claude Code 对模型 id 的默认上下文是 **200k**。只有 id 以 `[1m]` 结尾时，客户端才会按 **1M** 上下文做预算与自动压缩（这是 Claude Code 本地约定，不是上游真实模型名）。
+
+代理会：
+
+1. 在 `GET /v1/models` 为每个 Claude 别名额外暴露 `claude-...[1m]`（`context_window=1000000`）
+2. 在 `ResolveModel` 里去掉 `[1m]` 后再做别名映射，因此上游仍收到普通 Grok 模型名
+
+推荐长会话用法：
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+export ANTHROPIC_AUTH_TOKEN="$(jq -r .api_key data/meta.json)"
+export ANTHROPIC_MODEL='claude-opus-4-6[1m]'
+
+claude --effort high
+```
+
+也可在 Claude Code 的模型选择器里选带 `(1M context)` 的条目。
+
+> 注意：`[1m]` 只改变 Claude Code 侧的上下文预算；实际上游窗口仍受 Grok 模型与代理 `anthropic.soft_input_tokens` / `max_input_tokens` 限制。长会话请保持 `anthropic.auto_compact: true`。
+
 通过 `anthropic.model_aliases` 可以把 Claude 模型映射到指定 Grok 模型。
 
 ## OpenAI 兼容客户端

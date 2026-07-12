@@ -303,3 +303,113 @@ func TestParseRetryAfter(t *testing.T) {
 		t.Fatalf("date=%v", d)
 	}
 }
+
+
+func TestIsFreeUsageExhaustedBody(t *testing.T) {
+	cases := []struct {
+		body string
+		want bool
+	}{
+		{`{"error":{"code":"subscription:free-usage-exhausted","message":"You've used all the included free usage for model grok-4.5-build-free for now. Usage resets over a rolling 24-hour window — tokens (actual/limit): 2024575/2000000."}}`, true},
+		{`free_usage_exhausted`, true},
+		{`Free Tier Usage Exhausted`, true},
+		{`{"error":"rate limit, try again soon"}`, false},
+		{`{"error":{"message":"too many requests"}}`, false},
+		{``, false},
+	}
+	for _, tc := range cases {
+		if got := isFreeUsageExhaustedBody(tc.body); got != tc.want {
+			t.Fatalf("body=%q got=%v want=%v", tc.body, got, tc.want)
+		}
+	}
+}
+
+func TestFreeUsageExhaustedDurationDefault(t *testing.T) {
+	ex := &Executor{}
+	if d := ex.freeUsageExhaustedDuration(); d != 20*time.Hour {
+		t.Fatalf("default=%v", d)
+	}
+	ex.FreeUsageExhaustedCooldown = 30 * time.Hour
+	if d := ex.freeUsageExhaustedDuration(); d != 30*time.Hour {
+		t.Fatalf("override=%v", d)
+	}
+}
+
+func TestExecutorPostFailoverOnFreeUsageExhausted(t *testing.T) {
+	var mu sync.Mutex
+	hits := map[string]int{}
+	bodyA := `{"error":{"code":"subscription:free-usage-exhausted","message":"You've used all the included free usage for model grok-4.5-build-free for now. Usage resets over a rolling 24-hour window — tokens (actual/limit): 2024575/2000000. Upgrade to a Grok subscription for higher limits: https://grok.com/supergrok"}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authz := r.Header.Get("Authorization")
+		mu.Lock()
+		hits[authz]++
+		mu.Unlock()
+		if strings.Contains(authz, "token-a") {
+			// No Retry-After — free quota is a long rolling window, not a short RL.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(bodyA))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"ok-from-b"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	now := time.Date(2026, 7, 12, 6, 40, 0, 0, time.UTC)
+	sel := lb.New(config.LBConfig{Strategy: "priority_rr", Cooldown: config.CooldownConfig{BaseSec: 300, MaxSec: 3600}})
+	store := newMemStore(
+		storage.Credential{ID: "cred_a", AccessToken: "token-a", Enabled: true, Priority: 200},
+		storage.Credential{ID: "cred_b", AccessToken: "token-b", Enabled: true, Priority: 100},
+	)
+	ex := &Executor{
+		Store:                      store,
+		Selector:                   sel,
+		Upstream:                   upstream.NewClient(upstream.Config{BaseURL: srv.URL + "/v1", HTTPClient: srv.Client()}),
+		Refresher:                  passthroughRefresher{},
+		MaxAttempts:                4,
+		FreeUsageExhaustedCooldown: 20 * time.Hour,
+		Now:                        func() time.Time { return now },
+	}
+	resp, err := ex.Post(context.Background(), "grok-4.5-build-free", "", []byte(`{"model":"grok-4.5-build-free"}`), false)
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(raw), "ok-from-b") {
+		t.Fatalf("status=%d body=%s hits=%v", resp.StatusCode, raw, hits)
+	}
+	if hits["Bearer token-a"] != 1 || hits["Bearer token-b"] != 1 {
+		t.Fatalf("expected one hit each, hits=%v", hits)
+	}
+
+	// Exhausted account must stay out for the long free-usage cooldown, not max_sec (1h).
+	later := now.Add(2 * time.Hour)
+	picked, err := sel.Pick(mustList(store), "", later)
+	if err != nil {
+		t.Fatalf("Pick after 2h: %v", err)
+	}
+	if picked.ID == "cred_a" {
+		t.Fatalf("cred_a should still be cooling after 2h, got %s", picked.ID)
+	}
+
+	// After the free-usage window, higher-priority cred_a should be eligible again.
+	after := now.Add(20*time.Hour + time.Minute)
+	picked, err = sel.Pick(mustList(store), "", after)
+	if err != nil {
+		t.Fatalf("Pick after free cooldown: %v", err)
+	}
+	if picked.ID != "cred_a" {
+		t.Fatalf("expected cred_a after free cooldown ended, got %s", picked.ID)
+	}
+}
+
+func mustList(store Store) []storage.Credential {
+	creds, err := store.ListCredentials()
+	if err != nil {
+		panic(err)
+	}
+	return creds
+}

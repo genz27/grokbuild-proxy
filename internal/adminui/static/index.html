@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="dark" />
   <title>grokbuild 管理后台</title>
-  <link rel="stylesheet" href="/admin/ui/app.css?v=4" />
+  <link rel="stylesheet" href="/admin/ui/app.css?v=8" />
 </head>
 <body>
   <div id="app">
@@ -61,24 +61,27 @@
               <button type="button" class="btn" id="btn-import-raw">粘贴 JSON 导入</button>
             </div>
           </div>
+          <div id="cred-pool-stats" class="pool-stats hidden" aria-live="polite"></div>
           <div id="cred-empty" class="empty card hidden">
             <h3>暂无凭证</h3>
-            <p class="muted">可从本机默认路径导入，或粘贴 Grok 授权 JSON 文件内容。</p>
+            <p class="muted">可从本机默认路径导入，或粘贴 Grok / CLIProxyAPI / accounts 导出 JSON。</p>
           </div>
-          <div id="cred-list" class="card-grid"></div>
+          <div id="cred-list" class="credential-list"></div>
+          <nav id="cred-pagination" class="pagination hidden" aria-label="账号凭证分页"></nav>
         </section>
 
         <section id="page-clients" class="page hidden">
           <div class="page-head">
             <div>
               <h2>客户端密钥</h2>
-              <p class="muted">下游 API 密钥 · 创建时仅展示一次明文</p>
+              <p class="muted">下游 API 密钥 · 管理员密钥与客户端密钥管理</p>
             </div>
             <div class="row gap">
               <button type="button" class="btn" id="btn-client-refresh">刷新</button>
               <button type="button" class="btn btn-primary" id="btn-client-create">创建密钥</button>
             </div>
           </div>
+          <div id="admin-key-panel" class="card secrets-panel stack"></div>
           <div id="client-empty" class="empty card hidden">
             <h3>暂无客户端密钥</h3>
             <p class="muted">创建后会得到一次性明文密钥，用于 OpenAI 兼容客户端或 Claude Code。</p>
@@ -90,10 +93,11 @@
           <div class="page-head">
             <div>
               <h2>系统信息</h2>
-              <p class="muted">进程配置与上游摘要</p>
+              <p class="muted">进程配置、账号池与请求性能</p>
             </div>
             <button type="button" class="btn" id="btn-system-refresh">刷新</button>
           </div>
+          <div id="system-metrics" class="stack"></div>
           <div id="system-body" class="card stack"></div>
         </section>
 
@@ -133,6 +137,6 @@
     </div>
   </div>
 
-  <script src="/admin/ui/app.js?v=4" defer></script>
+  <script src="/admin/ui/app.js?v=8" defer></script>
 </body>
 </html>

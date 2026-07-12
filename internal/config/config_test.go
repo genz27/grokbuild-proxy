@@ -43,8 +43,8 @@ func TestDefaultAlignedWithPlan(t *testing.T) {
 	if !cfg.Anthropic.StripUnknownBetas {
 		t.Fatal("strip_unknown_betas should be true")
 	}
-	if cfg.Anthropic.CountTokens {
-		t.Fatal("count_tokens should be false for MVP")
+	if !cfg.Anthropic.CountTokens {
+		t.Fatal("count_tokens should default to true for Claude Code compatibility")
 	}
 	wantAliases := map[string]string{
 		"claude-sonnet-4":   "grok-4.5",
@@ -81,8 +81,11 @@ func TestDefaultAlignedWithPlan(t *testing.T) {
 	if cfg.Limits.MaxBodyBytes != 20*1024*1024 {
 		t.Fatalf("max_body_bytes: %d", cfg.Limits.MaxBodyBytes)
 	}
-	if cfg.Limits.RequestTimeoutSec != 600 || cfg.Limits.MaxConcurrent != 64 {
+	if cfg.Limits.RequestTimeoutSec != 600 || cfg.Limits.MaxConcurrent != 2048 {
 		t.Fatalf("limits: %+v", cfg.Limits)
+	}
+	if cfg.LB.Prefetch.IntervalSec != 30 || cfg.LB.Prefetch.MaxPerTick != 128 || cfg.LB.Prefetch.Concurrency != 16 {
+		t.Fatalf("prefetch defaults: %+v", cfg.LB.Prefetch)
 	}
 	if cfg.Logging.Level != "info" {
 		t.Fatalf("logging.level: %q", cfg.Logging.Level)
@@ -167,7 +170,7 @@ logging:
 		t.Fatal("strip_unknown_betas should be false after override")
 	}
 	if cfg.Anthropic.CountTokens {
-		t.Fatal("count_tokens must remain disabled")
+		t.Fatal("explicit count_tokens=false should be preserved")
 	}
 }
 
@@ -231,7 +234,6 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		{"zero timeout", func(c *Config) { c.Limits.RequestTimeoutSec = 0 }},
 		{"zero concurrent", func(c *Config) { c.Limits.MaxConcurrent = 0 }},
 		{"invalid logging level", func(c *Config) { c.Logging.Level = "verbose" }},
-		{"unsupported count_tokens", func(c *Config) { c.Anthropic.CountTokens = true }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -284,6 +286,19 @@ func TestResolveModel(t *testing.T) {
 	if got := cfg.ResolveModel(""); got != "" {
 		t.Fatalf("empty: %q", got)
 	}
+	// Claude Code 1M context marker is a client-side window hint.
+	if got := cfg.ResolveModel("claude-opus-4-6[1m]"); got != "grok-4.5" {
+		t.Fatalf("alias with [1m]: %q", got)
+	}
+	if got := cfg.ResolveModel("claude-sonnet-4[1M]"); got != "grok-4.5" {
+		t.Fatalf("alias with [1M] case: %q", got)
+	}
+	if got := cfg.ResolveModel("grok-4.5[1m]"); got != "grok-4.5" {
+		t.Fatalf("passthrough with [1m]: %q", got)
+	}
+	if got := cfg.ResolveModel("claude-opus-4-6[1m] "); got != "grok-4.5" {
+		t.Fatalf("trimmed [1m]: %q", got)
+	}
 }
 
 func TestDurationHelpers(t *testing.T) {
@@ -296,5 +311,32 @@ func TestDurationHelpers(t *testing.T) {
 	}
 	if cfg.RefreshSkew() != 180*time.Second {
 		t.Fatalf("skew: %v", cfg.RefreshSkew())
+	}
+}
+
+
+func TestFreeUsageExhaustedCooldownDefault(t *testing.T) {
+	cfg := Default()
+	if d := cfg.FreeUsageExhaustedCooldown(); d != 20*time.Hour {
+		t.Fatalf("default free usage cooldown=%v", d)
+	}
+	cfg.LB.Cooldown.FreeUsageExhaustedSec = 3600
+	if d := cfg.FreeUsageExhaustedCooldown(); d != time.Hour {
+		t.Fatalf("override=%v", d)
+	}
+}
+
+func TestMaxAttemptsDefault(t *testing.T) {
+	cfg := Default()
+	if n := cfg.MaxAttempts(); n != 32 {
+		t.Fatalf("default max attempts=%d", n)
+	}
+	cfg.LB.MaxAttempts = 8
+	if n := cfg.MaxAttempts(); n != 8 {
+		t.Fatalf("override=%d", n)
+	}
+	cfg.LB.MaxAttempts = 0
+	if n := cfg.MaxAttempts(); n != 32 {
+		t.Fatalf("zero should fall back to default, got %d", n)
 	}
 }

@@ -316,10 +316,10 @@ func TestApplyCooldownToCredential(t *testing.T) {
 	if c.CooldownUntil == nil {
 		t.Fatal("expected CooldownUntil set")
 	}
-	// Retry-After path still adds jitter (0..10%), accept [5m, 5m+30s].
+	// Explicit Retry-After is exact (no jitter).
 	delta := c.CooldownUntil.Sub(now)
-	if delta < 5*time.Minute || delta > 5*time.Minute+30*time.Second {
-		t.Fatalf("CooldownUntil delta=%v", delta)
+	if delta != 5*time.Minute {
+		t.Fatalf("CooldownUntil delta=%v want exactly 5m", delta)
 	}
 	if c.FailureCount != 1 {
 		t.Fatalf("FailureCount=%d want 1", c.FailureCount)
@@ -493,6 +493,91 @@ func TestPersistedHealthCannotReorderFailureAfterSuccess(t *testing.T) {
 	store.mu.Unlock()
 	if final.FailureCount != 0 || final.CooldownUntil != nil || final.LastSuccessAt == nil {
 		t.Fatalf("persisted state was reordered: %+v", final)
+	}
+}
+
+
+func TestCooldownDuration_ExplicitRetryAfterNoJitter(t *testing.T) {
+	s := New(testCfg("priority_rr"))
+	// Explicit Retry-After / free-usage windows must be exact across many draws.
+	// With old jitter behavior, 200 samples of 20h would almost never all equal 20h.
+	const n = 200
+	want := 20 * time.Hour
+	for i := 0; i < n; i++ {
+		got := s.cooldownDuration(429, want, i%5)
+		if got != want {
+			t.Fatalf("sample %d: cooldownDuration(429, 20h)=%v want exact %v", i, got, want)
+		}
+	}
+	// 402 with explicit Retry-After is also exact.
+	want402 := 6 * time.Hour
+	for i := 0; i < n; i++ {
+		got := s.cooldownDuration(402, want402, 0)
+		if got != want402 {
+			t.Fatalf("sample %d: cooldownDuration(402, 6h)=%v want exact %v", i, got, want402)
+		}
+	}
+}
+
+func TestCooldownDuration_ComputedStillHasJitter(t *testing.T) {
+	s := New(testCfg("priority_rr"))
+	// No Retry-After → base * 2^0 = 5m, plus 0..10% jitter.
+	base := 5 * time.Minute
+	seen := map[time.Duration]int{}
+	const n = 300
+	for i := 0; i < n; i++ {
+		got := s.cooldownDuration(429, 0, 0)
+		if got < base || got > base+base/10 {
+			t.Fatalf("sample %d: computed cooldown=%v outside [%v, %v]", i, got, base, base+base/10)
+		}
+		seen[got]++
+	}
+	if len(seen) < 2 {
+		t.Fatalf("expected jitter variance across %d samples, unique=%d", n, len(seen))
+	}
+}
+
+func TestMarkFailure_ExplicitRetryAfterExactThenEligible(t *testing.T) {
+	s := New(testCfg("priority_rr"))
+	now := time.Date(2026, 7, 12, 6, 40, 0, 0, time.UTC)
+	creds := []storage.Credential{
+		cred("free_exhausted", 200, true),
+		cred("backup", 100, true),
+	}
+
+	// Stress: many free-usage exhaustion marks must all land on exact 20h.
+	const n = 100
+	window := 20 * time.Hour
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("free_%d", i)
+		s.MarkFailure(id, 429, window, now)
+		s.mu.Lock()
+		until := s.states[id].CooldownUntil
+		s.mu.Unlock()
+		if !until.Equal(now.Add(window)) {
+			t.Fatalf("sample %d: CooldownUntil=%v want exactly %v (delta=%v)", i, until, now.Add(window), until.Sub(now))
+		}
+	}
+
+	// Full pick path: exhausted high-priority account stays out until exact window ends.
+	s.MarkFailure("free_exhausted", 429, window, now)
+	// Still cooling just before window ends.
+	stillCooling := now.Add(window - time.Nanosecond)
+	picked, err := s.Pick(creds, "", stillCooling)
+	if err != nil {
+		t.Fatalf("Pick while cooling: %v", err)
+	}
+	if picked.ID != "backup" {
+		t.Fatalf("while cooling expected backup, got %s", picked.ID)
+	}
+	// Exactly at window end, high-priority free_exhausted is eligible again.
+	atExpiry := now.Add(window)
+	picked, err = s.Pick(creds, "", atExpiry)
+	if err != nil {
+		t.Fatalf("Pick at expiry: %v", err)
+	}
+	if picked.ID != "free_exhausted" {
+		t.Fatalf("at exact expiry expected free_exhausted, got %s", picked.ID)
 	}
 }
 

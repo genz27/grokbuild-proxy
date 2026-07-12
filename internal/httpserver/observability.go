@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -30,6 +32,70 @@ type Metrics struct {
 	inflight      atomic.Int64
 	responseBytes atomic.Uint64
 	durationNanos atomic.Uint64
+	mu            sync.Mutex
+	buckets       [60]MetricPoint
+}
+
+type MetricPoint struct {
+	Time       time.Time `json:"time"`
+	Requests   uint64    `json:"requests"`
+	Successes  uint64    `json:"successes"`
+	Errors     uint64    `json:"errors"`
+	DurationMS float64   `json:"duration_ms"`
+}
+
+type MetricsSnapshot struct {
+	Requests      uint64        `json:"requests"`
+	Errors        uint64        `json:"errors"`
+	Successes     uint64        `json:"successes"`
+	Inflight      int64         `json:"inflight"`
+	ResponseBytes uint64        `json:"response_bytes"`
+	AverageMS     float64       `json:"average_ms"`
+	Series        []MetricPoint `json:"series"`
+}
+
+func (m *Metrics) Snapshot() MetricsSnapshot {
+	if m == nil {
+		return MetricsSnapshot{}
+	}
+	requests := m.requests.Load()
+	errors := m.errors.Load()
+	s := MetricsSnapshot{
+		Requests:      requests,
+		Errors:        errors,
+		Inflight:      m.inflight.Load(),
+		ResponseBytes: m.responseBytes.Load(),
+	}
+	if requests >= errors {
+		s.Successes = requests - errors
+	}
+	if requests > 0 {
+		s.AverageMS = float64(m.durationNanos.Load()) / float64(time.Millisecond) / float64(requests)
+	}
+	m.mu.Lock()
+	for i := 0; i < len(m.buckets); i++ {
+		p := m.buckets[i]
+		if !p.Time.IsZero() {
+			s.Series = append(s.Series, p)
+		}
+	}
+	m.mu.Unlock()
+	sort.Slice(s.Series, func(i, j int) bool {
+		return s.Series[i].Time.Before(s.Series[j].Time)
+	})
+	return s
+}
+
+func (m *Metrics) observePoint(status int, elapsed time.Duration, now time.Time) {
+	minute := now.UTC().Truncate(time.Minute)
+	idx := int(minute.Unix()/60) % len(m.buckets)
+	m.mu.Lock()
+	p := &m.buckets[idx]
+	if !p.Time.Equal(minute) { *p = MetricPoint{Time: minute} }
+	p.Requests++
+	if status >= 400 { p.Errors++ } else { p.Successes++ }
+	p.DurationMS += float64(elapsed.Microseconds()) / 1000
+	m.mu.Unlock()
 }
 
 func (m *Metrics) Handler() http.Handler {
@@ -123,6 +189,9 @@ func (m *Middleware) Observe(next http.Handler) http.Handler {
 				metrics.responseBytes.Add(uint64(recorder.bytes))
 			}
 			metrics.durationNanos.Add(uint64(elapsed))
+			if strings.HasPrefix(r.URL.Path, "/v1/") {
+				metrics.observePoint(recorder.status, elapsed, time.Now())
+			}
 		}
 		logger := m.Logger
 		if logger == nil {

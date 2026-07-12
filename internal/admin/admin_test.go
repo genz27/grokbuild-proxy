@@ -151,6 +151,31 @@ func (f *fakeStore) DeleteClient(id string) error {
 	return nil
 }
 
+func (f *fakeStore) GetBootstrapKeys() (apiKey, adminKey string, err error) {
+	return "sk-api-fake", "sk-admin-fake", nil
+}
+
+func (f *fakeStore) SetAdminKey(newKey string) (adminKey string, generated bool, err error) {
+	key := strings.TrimSpace(newKey)
+	if key == "" {
+		return "sk-admin-rotated", true, nil
+	}
+	return key, false, nil
+}
+
+func (f *fakeStore) RotateClientKey(id string) (storage.CreateClientResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.cli[id]
+	if !ok {
+		return storage.CreateClientResult{}, errNF("client", id)
+	}
+	c.Prefix = "sk-rot"
+	f.cli[id] = c
+	return storage.CreateClientResult{Client: c, Plaintext: "sk-rotated-plaintext"}, nil
+}
+
+
 type nfErr struct{ kind, id string }
 
 func (e nfErr) Error() string { return "storage: " + e.kind + " " + e.id + " not found" }
@@ -204,6 +229,35 @@ func TestAdminCredentialsMasked(t *testing.T) {
 	at, _ := parsed.Credentials[0]["access_token"].(string)
 	if at == "super-secret-access-token-value" || !strings.Contains(at, "***") {
 		t.Fatalf("access_token not masked: %q", at)
+	}
+}
+
+func TestAdminCredentialsPagination(t *testing.T) {
+	store := newFakeStore()
+	for i := 0; i < 45; i++ {
+		id := fmt.Sprintf("cred_%02d", i)
+		store.creds[id] = storage.Credential{ID: id, Enabled: true}
+	}
+	h := &Handlers{Store: store, AdminKey: "sk-admin-test", Config: config.Default()}
+	req := httptest.NewRequest(http.MethodGet, "/admin/credentials?page=2&page_size=20", nil)
+	req.Header.Set("Authorization", "Bearer sk-admin-test")
+	rr := httptest.NewRecorder()
+	h.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var parsed struct {
+		Credentials []map[string]any `json:"credentials"`
+		Page        int              `json:"page"`
+		PageSize    int              `json:"page_size"`
+		Total       int              `json:"total"`
+		TotalPages  int              `json:"total_pages"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Credentials) != 20 || parsed.Page != 2 || parsed.PageSize != 20 || parsed.Total != 45 || parsed.TotalPages != 3 {
+		t.Fatalf("unexpected page: %+v credentials=%d", parsed, len(parsed.Credentials))
 	}
 }
 

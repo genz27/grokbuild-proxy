@@ -149,31 +149,68 @@ func (s *Store) SetClientDisabled(id string, disabled bool) (ClientKey, error) {
 
 // LookupClientByPlaintext finds a non-disabled client matching the raw key.
 // Returns ok=false when not found or disabled.
+// Hot path uses an in-process hash map without taking the disk flock.
 func (s *Store) LookupClientByPlaintext(plaintext string) (ClientKey, bool, error) {
+	if s == nil {
+		return ClientKey{}, false, fmt.Errorf("storage: nil store")
+	}
 	if plaintext == "" {
 		return ClientKey{}, false, nil
 	}
 	hash := HashKey(plaintext)
+
+	s.mu.Lock()
+	if s.clientCacheValid {
+		c, hit := s.clientByHash[hash]
+		s.mu.Unlock()
+		if !hit || c.Disabled {
+			return ClientKey{}, false, nil
+		}
+		return c, true, nil
+	}
+	s.mu.Unlock()
+
 	var found ClientKey
 	var ok bool
 	err := s.withLock(func() error {
-		doc, err := s.loadClients()
-		if err != nil {
+		if err := s.ensureClientCacheLocked(); err != nil {
 			return err
 		}
-		for _, c := range doc.Clients {
-			if c.KeyHash == hash {
-				if c.Disabled {
-					return nil
-				}
-				found = c
-				ok = true
-				return nil
-			}
+		c, hit := s.clientByHash[hash]
+		if !hit || c.Disabled {
+			return nil
 		}
+		found = c
+		ok = true
 		return nil
 	})
 	return found, ok, err
+}
+
+// ensureClientCacheLocked rebuilds the client hash map. Caller must hold s.mu
+// (withLock already does).
+func (s *Store) ensureClientCacheLocked() error {
+	if s.clientCacheValid && s.clientByHash != nil {
+		return nil
+	}
+	doc, err := s.loadClients()
+	if err != nil {
+		return err
+	}
+	s.rebuildClientCache(doc.Clients)
+	return nil
+}
+
+func (s *Store) rebuildClientCache(clients []ClientKey) {
+	m := make(map[string]ClientKey, len(clients))
+	for _, c := range clients {
+		if c.KeyHash == "" {
+			continue
+		}
+		m[c.KeyHash] = c
+	}
+	s.clientByHash = m
+	s.clientCacheValid = true
 }
 
 // bootstrapMeta holds process-local plaintext bootstrap secrets (mode 0600).
@@ -365,5 +402,96 @@ func (s *Store) saveClients(doc clientsDoc) error {
 	if doc.Clients == nil {
 		doc.Clients = []ClientKey{}
 	}
+	// Keep auth hot path map in sync with the durable write.
+	s.rebuildClientCache(doc.Clients)
 	return writeJSONFile(s.clientsPath(), doc)
+}
+
+// GetBootstrapKeys returns plaintext bootstrap secrets from meta.json.
+// Empty strings mean the corresponding secret is not stored.
+func (s *Store) GetBootstrapKeys() (apiKey, adminKey string, err error) {
+	err = s.withLock(func() error {
+		meta, err := s.loadMeta()
+		if err != nil {
+			return err
+		}
+		apiKey = strings.TrimSpace(meta.APIKey)
+		adminKey = strings.TrimSpace(meta.AdminKey)
+		return nil
+	})
+	return apiKey, adminKey, err
+}
+
+// SetAdminKey replaces the bootstrap admin key in meta.json.
+// Empty newKey mints a fresh sk-... secret.
+func (s *Store) SetAdminKey(newKey string) (adminKey string, generated bool, err error) {
+	err = s.withLock(func() error {
+		meta, err := s.loadMeta()
+		if err != nil {
+			return err
+		}
+		key := strings.TrimSpace(newKey)
+		if key == "" {
+			key, err = generateSKKey()
+			if err != nil {
+				return err
+			}
+			generated = true
+		}
+		if len(key) < 8 {
+			return fmt.Errorf("storage: admin key too short")
+		}
+		api := strings.TrimSpace(meta.APIKey)
+		if api != "" && api == key {
+			return fmt.Errorf("storage: admin key must differ from api key")
+		}
+		meta.AdminKey = key
+		if err := s.saveMeta(meta); err != nil {
+			return err
+		}
+		adminKey = key
+		return nil
+	})
+	return adminKey, generated, err
+}
+
+// RotateClientKey mints a new secret for an existing client id.
+// Only the hash/prefix are persisted; plaintext is returned once.
+func (s *Store) RotateClientKey(id string) (CreateClientResult, error) {
+	var result CreateClientResult
+	err := s.withLock(func() error {
+		doc, err := s.loadClients()
+		if err != nil {
+			return err
+		}
+		for i := range doc.Clients {
+			if doc.Clients[i].ID != id {
+				continue
+			}
+			plain, err := generateSKKey()
+			if err != nil {
+				return err
+			}
+			doc.Clients[i].KeyHash = HashKey(plain)
+			doc.Clients[i].Prefix = keyPrefix(plain)
+			if err := s.saveClients(doc); err != nil {
+				return err
+			}
+			// Keep bootstrap meta.api_key in sync when rotating the bootstrap client.
+			meta, err := s.loadMeta()
+			if err != nil {
+				return err
+			}
+			if doc.Clients[i].Name == "bootstrap-api" {
+				meta.APIKey = plain
+				if err := s.saveMeta(meta); err != nil {
+					return err
+				}
+			}
+			result = CreateClientResult{Client: doc.Clients[i], Plaintext: plain}
+			return nil
+		}
+		return fmt.Errorf("storage: client %q not found", id)
+	})
+	return result, err
 }

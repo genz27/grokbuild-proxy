@@ -50,6 +50,13 @@ func (h *Handlers) Register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /admin/clients/{id}", func(w http.ResponseWriter, r *http.Request) {
 		h.DeleteClient(w, r, r.PathValue("id"))
 	})
+	mux.HandleFunc("POST /admin/clients/{id}/rotate", func(w http.ResponseWriter, r *http.Request) {
+		h.RotateClient(w, r, r.PathValue("id"))
+	})
+
+	// Secrets
+	mux.HandleFunc("GET /admin/secrets/admin-key", h.GetAdminKey)
+	mux.HandleFunc("PUT /admin/secrets/admin-key", h.SetAdminKey)
 
 	// System
 	mux.HandleFunc("GET /admin/system", h.System)
@@ -81,6 +88,10 @@ func (h *Handlers) dispatchFallback(w http.ResponseWriter, r *http.Request) {
 		h.ListClients(w, r)
 	case path == "/admin/clients" && r.Method == http.MethodPost:
 		h.CreateClient(w, r)
+	case path == "/admin/secrets/admin-key" && r.Method == http.MethodGet:
+		h.GetAdminKey(w, r)
+	case path == "/admin/secrets/admin-key" && r.Method == http.MethodPut:
+		h.SetAdminKey(w, r)
 	case path == "/admin/system" && r.Method == http.MethodGet:
 		h.System(w, r)
 	default:
@@ -107,6 +118,10 @@ func (h *Handlers) dispatchFallback(w http.ResponseWriter, r *http.Request) {
 		if id, rest, ok := cutAfterPrefix(path, "/admin/clients/"); ok {
 			if rest == "" && r.Method == http.MethodDelete {
 				h.DeleteClient(w, r, id)
+				return
+			}
+			if rest == "rotate" && r.Method == http.MethodPost {
+				h.RotateClient(w, r, id)
 				return
 			}
 		}

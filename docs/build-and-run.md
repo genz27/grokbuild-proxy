@@ -231,6 +231,17 @@ export ANTHROPIC_MODEL=grok-4.5
 claude --effort high
 ```
 
+For Claude Code's 1M context budget (local client convention; upstream still
+uses the mapped Grok model), set a `[1m]`-suffixed Claude alias:
+
+```bash
+export ANTHROPIC_MODEL='claude-opus-4-6[1m]'
+```
+
+`GET /v1/models` advertises these siblings with `context_window=1000000`. The
+proxy strips `[1m]` in `ResolveModel` before alias mapping. Keep
+`anthropic.auto_compact: true` for long sessions.
+
 ### OpenAI SDKs
 
 ```bash

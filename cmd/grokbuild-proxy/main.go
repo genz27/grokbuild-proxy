@@ -101,15 +101,43 @@ func main() {
 		RequestTimeout:   cfg.RequestTimeout(),
 	})
 
-	selector := lb.New(cfg.LB).SetHealthStore(store)
+	healthQ := storage.NewHealthQueue(store, 2*time.Second)
+	healthQ.Start()
+	defer healthQ.Stop()
+	selector := lb.New(cfg.LB).SetHealthStore(healthQ)
 
 	exec := &proxy.Executor{
-		Store:     store,
-		Selector:  selector,
-		Upstream:  up,
-		Refresher: refresher,
-		Logger:    logger,
-		RequestID: httpserver.RequestIDFromContext,
+		Store:                        store,
+		Selector:                     selector,
+		Upstream:                     up,
+		Refresher:                    refresher,
+		UsageQueue:                   healthQ,
+		Logger:                       logger,
+		RequestID:                    httpserver.RequestIDFromContext,
+		MaxAttempts:                  cfg.MaxAttempts(),
+		FreeUsageExhaustedCooldown:   cfg.FreeUsageExhaustedCooldown(),
+	}
+	var prefetcher *proxy.Prefetcher
+	if cfg.PrefetchEnabled() {
+		prefetcher = &proxy.Prefetcher{
+			Store:       store,
+			Executor:    exec,
+			Interval:    cfg.PrefetchInterval(),
+			Skew:        cfg.RefreshSkew(),
+			MaxPerTick:  cfg.PrefetchMaxPerTick(),
+			Concurrency: cfg.PrefetchConcurrency(),
+			Logger:      logger,
+		}
+		prefetcher.Start()
+		defer prefetcher.Stop()
+		logger.Info("prefetch_enabled",
+			"interval_sec", int(cfg.PrefetchInterval().Seconds()),
+			"max_per_tick", cfg.PrefetchMaxPerTick(),
+			"concurrency", cfg.PrefetchConcurrency(),
+			"soft_demote_on_429", cfg.SoftDemoteOn429Enabled(),
+		)
+	} else {
+		logger.Info("prefetch_disabled")
 	}
 
 	oai := &openai.Handlers{
@@ -133,6 +161,11 @@ func main() {
 		AdminKey: adminKey,
 		Version:  version,
 		MaxBody:  cfg.Limits.MaxBodyBytes,
+		Metrics: func() any {
+			return map[string]any{
+				"path": exec.PathSnapshot(),
+			}
+		},
 	}
 
 	handler := httpserver.New(httpserver.Options{

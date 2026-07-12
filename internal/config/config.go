@@ -55,6 +55,15 @@ type AnthropicConfig struct {
 	PassthroughPrefixes []string          `yaml:"passthrough_prefixes"`
 	StripUnknownBetas   bool              `yaml:"strip_unknown_betas"`
 	CountTokens         bool              `yaml:"count_tokens"`
+	// Context protection / auto-compact (Claude Code long-session support).
+	// SoftInputTokens triggers auto-compact; MaxInputTokens hard-rejects after compact.
+	// Defaults applied when zero: soft=420000, max=480000, tool_result=120000, keep=16.
+	AutoCompact        *bool `yaml:"auto_compact"`
+	SoftInputTokens    int   `yaml:"soft_input_tokens"`
+	MaxInputTokens     int   `yaml:"max_input_tokens"`
+	MaxToolResultChars int   `yaml:"max_tool_result_chars"`
+	KeepRecentMessages int   `yaml:"keep_recent_messages"`
+	PreserveCacheHints *bool `yaml:"preserve_cache_hints"`
 }
 
 // LBConfig controls multi-credential selection and sticky sessions.
@@ -62,13 +71,30 @@ type LBConfig struct {
 	Strategy       string         `yaml:"strategy"`
 	StickyTTLSec   int            `yaml:"sticky_ttl_sec"`
 	RefreshSkewSec int            `yaml:"refresh_skew_sec"`
-	Cooldown       CooldownConfig `yaml:"cooldown"`
+	// MaxAttempts caps credential failover per request (0 = package default).
+	MaxAttempts int `yaml:"max_attempts"`
+	Cooldown    CooldownConfig `yaml:"cooldown"`
+	Prefetch    PrefetchConfig `yaml:"prefetch"`
+	// SoftDemoteOn429 temporarily lowers pick preference after 429s (in-memory).
+	// Success clears the demotion. Zero/false keeps default enabled behavior via Defaults.
+	SoftDemoteOn429 *bool `yaml:"soft_demote_on_429"`
+}
+
+// PrefetchConfig controls background access-token pre-refresh.
+type PrefetchConfig struct {
+	Enabled     *bool `yaml:"enabled"`
+	IntervalSec int   `yaml:"interval_sec"`
+	MaxPerTick  int   `yaml:"max_per_tick"`
+	Concurrency int   `yaml:"concurrency"`
 }
 
 // CooldownConfig is exponential backoff bounds for failed credentials.
 type CooldownConfig struct {
 	BaseSec int `yaml:"base_sec"`
 	MaxSec  int `yaml:"max_sec"`
+	// FreeUsageExhaustedSec cools accounts after free-usage-exhausted (rolling 24h quota).
+	// 0 uses the default (20h). This is intentionally longer than MaxSec.
+	FreeUsageExhaustedSec int `yaml:"free_usage_exhausted_sec"`
 }
 
 // LimitsConfig enforces request size, timeout and concurrency caps.
@@ -124,21 +150,35 @@ func Default() Config {
 			},
 			PassthroughPrefixes: []string{"grok-"},
 			StripUnknownBetas:   true,
-			CountTokens:         false,
+			CountTokens:         true,
+			SoftInputTokens:     400000,
+			MaxInputTokens:      460000,
+			MaxToolResultChars:  120000,
+			KeepRecentMessages:  16,
 		},
 		LB: LBConfig{
 			Strategy:       "priority_rr",
 			StickyTTLSec:   3600,
 			RefreshSkewSec: 180,
+			// High enough to skip free-exhausted accounts without surfacing 429 to clients.
+			MaxAttempts: 32,
 			Cooldown: CooldownConfig{
-				BaseSec: 300,
-				MaxSec:  3600,
+				BaseSec:               300,
+				MaxSec:                3600,
+				FreeUsageExhaustedSec: 72000, // 20h — free quota is a rolling 24h window
+			},
+			Prefetch: PrefetchConfig{
+				IntervalSec: 30,
+				MaxPerTick:  128,
+				Concurrency: 16,
 			},
 		},
 		Limits: LimitsConfig{
 			MaxBodyBytes:      20 * 1024 * 1024,
 			RequestTimeoutSec: 600,
-			MaxConcurrent:     64,
+			// Sized for multi-thousand concurrent SSE sessions on a single node.
+			// Raise further only after host FD/CPU headroom is confirmed.
+			MaxConcurrent: 2048,
 		},
 		Logging: LoggingConfig{
 			Level: "info",
@@ -235,6 +275,21 @@ func (c Config) Validate() error {
 	if c.LB.Cooldown.MaxSec > 0 && c.LB.Cooldown.BaseSec > c.LB.Cooldown.MaxSec {
 		return fmt.Errorf("lb.cooldown.base_sec must be <= max_sec")
 	}
+	if c.LB.Cooldown.FreeUsageExhaustedSec < 0 {
+		return fmt.Errorf("lb.cooldown.free_usage_exhausted_sec must be >= 0")
+	}
+	if c.LB.MaxAttempts < 0 {
+		return fmt.Errorf("lb.max_attempts must be >= 0")
+	}
+	if c.LB.Prefetch.IntervalSec < 0 {
+		return fmt.Errorf("lb.prefetch.interval_sec must be >= 0")
+	}
+	if c.LB.Prefetch.MaxPerTick < 0 {
+		return fmt.Errorf("lb.prefetch.max_per_tick must be >= 0")
+	}
+	if c.LB.Prefetch.Concurrency < 0 {
+		return fmt.Errorf("lb.prefetch.concurrency must be >= 0")
+	}
 	if c.Limits.MaxBodyBytes <= 0 {
 		return fmt.Errorf("limits.max_body_bytes must be > 0")
 	}
@@ -244,13 +299,19 @@ func (c Config) Validate() error {
 	if c.Limits.MaxConcurrent <= 0 {
 		return fmt.Errorf("limits.max_concurrent must be > 0")
 	}
+	if c.Anthropic.SoftInputTokens < 0 || c.Anthropic.MaxInputTokens < 0 {
+		return fmt.Errorf("anthropic soft/max input tokens must be >= 0")
+	}
+	if c.Anthropic.MaxInputTokens > 0 && c.Anthropic.SoftInputTokens > c.Anthropic.MaxInputTokens {
+		return fmt.Errorf("anthropic.soft_input_tokens must be <= max_input_tokens")
+	}
+	if c.Anthropic.MaxToolResultChars < 0 || c.Anthropic.KeepRecentMessages < 0 {
+		return fmt.Errorf("anthropic max_tool_result_chars/keep_recent_messages must be >= 0")
+	}
 	switch strings.ToLower(strings.TrimSpace(c.Logging.Level)) {
 	case "debug", "info", "warn", "warning", "error":
 	default:
 		return fmt.Errorf("logging.level must be debug, info, warn, or error")
-	}
-	if c.Anthropic.CountTokens {
-		return fmt.Errorf("anthropic.count_tokens is not implemented and must be false")
 	}
 	return c.ValidateListen(c.Listen)
 }
@@ -322,11 +383,17 @@ func (c Config) ResolveModel(model string) string {
 // ResolveModel maps an Anthropic model id using explicit aliases only.
 // Unknown future model ids are not guessed because their capabilities may
 // differ from the configured target.
+//
+// Claude Code appends a literal "[1m]" suffix to model ids when the user
+// selects 1M context. That suffix only changes the client's local window
+// budget; strip it before alias lookup / passthrough so upstream receives a
+// real model id.
 func (c AnthropicConfig) ResolveModel(model string) string {
 	model = strings.TrimSpace(model)
 	if model == "" {
 		return model
 	}
+	model = stripClaudeCodeContextSuffix(model)
 	for _, p := range c.PassthroughPrefixes {
 		if p != "" && len(model) >= len(p) && model[:len(p)] == p {
 			return model
@@ -336,4 +403,129 @@ func (c AnthropicConfig) ResolveModel(model string) string {
 		return alias
 	}
 	return model
+}
+
+// stripClaudeCodeContextSuffix removes Claude Code's local context-window
+// marker (e.g. "claude-opus-4-6[1m]" → "claude-opus-4-6").
+func stripClaudeCodeContextSuffix(model string) string {
+	const suffix = "[1m]"
+	if len(model) < len(suffix) {
+		return model
+	}
+	if strings.EqualFold(model[len(model)-len(suffix):], suffix) {
+		return strings.TrimSpace(model[:len(model)-len(suffix)])
+	}
+	return model
+}
+
+// PrefetchEnabled reports whether background token prefetch is on (default true).
+func (c Config) PrefetchEnabled() bool {
+	if c.LB.Prefetch.Enabled == nil {
+		return true
+	}
+	return *c.LB.Prefetch.Enabled
+}
+
+// SoftDemoteOn429Enabled reports whether 429 soft demotion is on (default true).
+func (c Config) SoftDemoteOn429Enabled() bool {
+	if c.LB.SoftDemoteOn429 == nil {
+		return true
+	}
+	return *c.LB.SoftDemoteOn429
+}
+
+// MaxAttempts returns credential failover attempts per request (default 32).
+func (c Config) MaxAttempts() int {
+	if c.LB.MaxAttempts > 0 {
+		return c.LB.MaxAttempts
+	}
+	return 32
+}
+
+// FreeUsageExhaustedCooldown returns how long free-usage-exhausted accounts stay out.
+func (c Config) FreeUsageExhaustedCooldown() time.Duration {
+	sec := c.LB.Cooldown.FreeUsageExhaustedSec
+	if sec <= 0 {
+		sec = 72000 // 20h
+	}
+	return time.Duration(sec) * time.Second
+}
+
+// PrefetchInterval returns the prefetch scan interval.
+func (c Config) PrefetchInterval() time.Duration {
+	sec := c.LB.Prefetch.IntervalSec
+	if sec <= 0 {
+		sec = 30
+	}
+	return time.Duration(sec) * time.Second
+}
+
+// PrefetchMaxPerTick returns max credentials refreshed per tick.
+func (c Config) PrefetchMaxPerTick() int {
+	n := c.LB.Prefetch.MaxPerTick
+	if n <= 0 {
+		return 128
+	}
+	return n
+}
+
+// PrefetchConcurrency returns parallel refresh workers per tick.
+func (c Config) PrefetchConcurrency() int {
+	n := c.LB.Prefetch.Concurrency
+	if n <= 0 {
+		return 16
+	}
+	return n
+}
+
+// AutoCompactEnabled reports whether request auto-compact is on (default true).
+func (c AnthropicConfig) AutoCompactEnabled() bool {
+	if c.AutoCompact == nil {
+		return true
+	}
+	return *c.AutoCompact
+}
+
+// PreserveCacheHintsEnabled reports whether cache_control hints are preserved (default true).
+func (c AnthropicConfig) PreserveCacheHintsEnabled() bool {
+	if c.PreserveCacheHints == nil {
+		return true
+	}
+	return *c.PreserveCacheHints
+}
+
+// EffectiveSoftInputTokens returns soft compact threshold with defaults.
+func (c AnthropicConfig) EffectiveSoftInputTokens() int {
+	if c.SoftInputTokens > 0 {
+		return c.SoftInputTokens
+	}
+	if c.MaxInputTokens > 0 {
+		// soft at 90% of hard limit when only hard is set
+		return c.MaxInputTokens * 9 / 10
+	}
+	return 400000
+}
+
+// EffectiveMaxInputTokens returns hard reject threshold with defaults.
+func (c AnthropicConfig) EffectiveMaxInputTokens() int {
+	if c.MaxInputTokens > 0 {
+		return c.MaxInputTokens
+	}
+	return 460000
+}
+
+// EffectiveMaxToolResultChars returns tool_result truncation budget.
+func (c AnthropicConfig) EffectiveMaxToolResultChars() int {
+	if c.MaxToolResultChars > 0 {
+		return c.MaxToolResultChars
+	}
+	return 120000
+}
+
+// EffectiveKeepRecentMessages returns how many recent messages survive compact.
+func (c AnthropicConfig) EffectiveKeepRecentMessages() int {
+	if c.KeepRecentMessages > 0 {
+		return c.KeepRecentMessages
+	}
+	return 16
 }

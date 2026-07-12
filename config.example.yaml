@@ -34,17 +34,36 @@ anthropic:
   passthrough_prefixes: ["grok-"]
   # Unknown beta extensions are dropped; recognized thinking/effort is mapped.
   strip_unknown_betas: true
-  count_tokens: false
+  count_tokens: true
+  # Auto-compact long Claude Code sessions before they hit model limits.
+  auto_compact: true
+  soft_input_tokens: 400000
+  max_input_tokens: 460000
+  max_tool_result_chars: 120000
+  keep_recent_messages: 16
+  preserve_cache_hints: true
 lb:
   strategy: "priority_rr"
   sticky_ttl_sec: 3600
   refresh_skew_sec: 180
+  # Walk past free-exhausted accounts before returning 429 to the client.
+  max_attempts: 32
   cooldown:
     base_sec: 300
     max_sec: 3600
+    # Free-tier quota is a rolling ~24h window; cool long enough to skip burned accounts.
+    free_usage_exhausted_sec: 72000
+  # Background access-token pre-refresh (reduces first-token latency).
+  prefetch:
+    enabled: true
+    interval_sec: 30
+    max_per_tick: 128
+    concurrency: 16
+  # Temporarily deprioritize accounts after 429; cleared on success.
+  soft_demote_on_429: true
 limits:
   max_body_bytes: 20971520
   request_timeout_sec: 600
-  max_concurrent: 64
+  max_concurrent: 2048
 logging:
   level: info

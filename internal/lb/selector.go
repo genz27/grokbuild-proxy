@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +23,11 @@ type healthStore interface {
 	PatchCredential(id string, mutate func(*storage.Credential) error) (storage.Credential, error)
 }
 
+// deferredHealthStore optionally coalesces health patches.
+type deferredHealthStore interface {
+	EnqueueHealth(id string, mutate func(*storage.Credential) error)
+}
+
 const successPersistenceInterval = 30 * time.Second
 
 type healthSnapshot struct {
@@ -34,10 +40,11 @@ type healthSnapshot struct {
 
 // Selector picks credentials according to strategy, sticky session and cooldown.
 type Selector struct {
-	strategy     string
-	stickyTTL    time.Duration
-	cooldownBase time.Duration
-	cooldownMax  time.Duration
+	strategy        string
+	stickyTTL       time.Duration
+	cooldownBase    time.Duration
+	cooldownMax     time.Duration
+	softDemoteOn429 bool
 
 	mu        sync.Mutex
 	persistMu sync.Mutex
@@ -75,14 +82,19 @@ func New(cfg config.LBConfig) *Selector {
 	if max <= 0 {
 		max = 3600 * time.Second
 	}
+	soft := true
+	if cfg.SoftDemoteOn429 != nil {
+		soft = *cfg.SoftDemoteOn429
+	}
 	return &Selector{
-		strategy:     strategy,
-		stickyTTL:    time.Duration(cfg.StickyTTLSec) * time.Second,
-		cooldownBase: base,
-		cooldownMax:  max,
-		priorityRR:   make(map[int]int),
-		sticky:       make(map[string]stickyBinding),
-		states:       make(map[string]*runtimeState),
+		strategy:        strategy,
+		stickyTTL:       time.Duration(cfg.StickyTTLSec) * time.Second,
+		cooldownBase:    base,
+		cooldownMax:     max,
+		softDemoteOn429: soft,
+		priorityRR:      make(map[int]int),
+		sticky:          make(map[string]stickyBinding),
+		states:          make(map[string]*runtimeState),
 	}
 }
 
@@ -149,6 +161,8 @@ func (s *Selector) MarkSuccess(credID, stickyKey string, now time.Time) {
 	st.FailureCount = 0
 	st.CooldownUntil = time.Time{}
 	st.LastError = ""
+	st.DemoteUntil = time.Time{}
+	st.DemoteScore = 0
 
 	if stickyKey != "" {
 		s.bindSticky(stickyKey, credID, now)
@@ -186,9 +200,25 @@ func (s *Selector) MarkFailure(credID string, status int, retryAfter time.Durati
 	} else {
 		st.LastError = "network error"
 	}
+	if s.softDemoteOn429 && status == 429 {
+		// Soft demote longer than the immediate cooldown so recovered accounts
+		// still trail healthier ones for a while.
+		st.DemoteScore++
+		extra := d * 2
+		if extra < 10*time.Minute {
+			extra = 10 * time.Minute
+		}
+		if extra > 2*time.Hour {
+			extra = 2 * time.Hour
+		}
+		until := now.Add(extra)
+		if until.After(st.DemoteUntil) {
+			st.DemoteUntil = until
+		}
+	}
 
 	// Sticky bindings to a cooling credential should not keep routing traffic there.
-	if status == 401 || status == 402 || status == 403 || status == 429 {
+	if d > 0 {
 		s.clearStickyForCred(credID)
 	}
 	failureCount := st.FailureCount
@@ -243,6 +273,30 @@ func (s *Selector) availableLocked(creds []storage.Credential, now time.Time) []
 			continue
 		}
 		out = append(out, c)
+	}
+	// Prefer: fresh AT + not demoted, then fresh demoted, then stale, then stale demoted.
+	// Stable partitions keep RR fairness inside each bucket.
+	if len(out) > 1 {
+		var freshOK, freshDemoted, staleOK, staleDemoted []storage.Credential
+		for _, c := range out {
+			demoted := s.isDemoted(c.ID, now)
+			fresh := preferFreshAccess(c, now)
+			switch {
+			case fresh && !demoted:
+				freshOK = append(freshOK, c)
+			case fresh && demoted:
+				freshDemoted = append(freshDemoted, c)
+			case !fresh && !demoted:
+				staleOK = append(staleOK, c)
+			default:
+				staleDemoted = append(staleDemoted, c)
+			}
+		}
+		out = out[:0]
+		out = append(out, freshOK...)
+		out = append(out, freshDemoted...)
+		out = append(out, staleOK...)
+		out = append(out, staleDemoted...)
 	}
 	return out
 }
@@ -327,6 +381,29 @@ func (s *Selector) ensureState(credID string) *runtimeState {
 		s.states[credID] = st
 	}
 	return st
+}
+
+
+// preferFreshAccess reports whether c currently has a non-expired access token.
+func (s *Selector) isDemoted(credID string, now time.Time) bool {
+	if s == nil || !s.softDemoteOn429 || credID == "" {
+		return false
+	}
+	st, ok := s.states[credID]
+	if !ok || st == nil {
+		return false
+	}
+	return !st.DemoteUntil.IsZero() && st.DemoteUntil.After(now)
+}
+
+func preferFreshAccess(c storage.Credential, now time.Time) bool {
+	if strings.TrimSpace(c.AccessToken) == "" {
+		return false
+	}
+	if c.ExpiresAt.IsZero() {
+		return true
+	}
+	return c.ExpiresAt.After(now)
 }
 
 func findByID(creds []storage.Credential, id string) (storage.Credential, bool) {

@@ -3,9 +3,11 @@ package anthropic
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -66,6 +68,33 @@ func (h *Handlers) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = r.Body.Close()
 
+	// Auto-compact + tool_result truncation + hard context guard.
+	guardCfg := ContextGuardConfig{
+		MaxInputTokens:     h.Cfg.EffectiveMaxInputTokens(),
+		SoftInputTokens:    h.Cfg.EffectiveSoftInputTokens(),
+		MaxToolResultChars: h.Cfg.EffectiveMaxToolResultChars(),
+		KeepRecentMessages: h.Cfg.EffectiveKeepRecentMessages(),
+		PreserveCacheHints: h.Cfg.PreserveCacheHintsEnabled(),
+		AutoCompact:        h.Cfg.AutoCompactEnabled(),
+	}
+	prepared, compact, gerr := PrepareAnthropicBody(raw, guardCfg)
+	if gerr != nil {
+		WriteError(w, http.StatusBadRequest, gerr.Error())
+		return
+	}
+	if compact.Applied {
+		w.Header().Set("X-Grokbuild-Context-Compact", "1")
+		if compact.DroppedMessages > 0 {
+			w.Header().Set("X-Grokbuild-Dropped-Messages", fmt.Sprintf("%d", compact.DroppedMessages))
+		}
+		if compact.TruncatedToolResults > 0 {
+			w.Header().Set("X-Grokbuild-Truncated-Tool-Results", fmt.Sprintf("%d", compact.TruncatedToolResults))
+		}
+		w.Header().Set("X-Grokbuild-Input-Tokens-Before", fmt.Sprintf("%d", compact.EstimatedBefore))
+		w.Header().Set("X-Grokbuild-Input-Tokens-After", fmt.Sprintf("%d", compact.EstimatedAfter))
+	}
+	raw = prepared
+
 	var probe struct {
 		Model    string          `json:"model"`
 		Stream   bool            `json:"stream"`
@@ -74,13 +103,15 @@ func (h *Handlers) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(raw, &probe)
 
 	resolved := h.resolve(probe.Model)
-	convID := sessionIDFromRequest(r)
+	convID := sessionIDFromRequest(r, raw)
 	thinkingBridge := thinkingBridgeFromRaw(probe.Thinking)
 
 	body, originalModel, stream, err := TranslateRequest(raw, TranslateReqOptions{
-		ResolvedModel:     resolved,
-		ConvID:            convID,
-		StripUnknownBetas: h.Cfg.StripUnknownBetas,
+		ResolvedModel:      resolved,
+		ConvID:             convID,
+		StripUnknownBetas:  h.Cfg.StripUnknownBetas,
+		PreserveCacheHints: h.Cfg.PreserveCacheHintsEnabled(),
+		MaxToolResultChars: h.Cfg.EffectiveMaxToolResultChars(),
 	})
 	if err != nil {
 		WriteError(w, http.StatusBadRequest, err.Error())
@@ -103,6 +134,10 @@ func (h *Handlers) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	if resp.StatusCode >= 400 {
 		rawErr, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		msg := FormatErrorMessage(resp.StatusCode, rawErr)
+		if IsContextTooLongMessage(msg) || IsContextTooLongMessage(string(rawErr)) {
+			WriteError(w, http.StatusBadRequest, "context_too_long: "+msg+"; try a new session or smaller tool outputs")
+			return
+		}
 		WriteError(w, resp.StatusCode, msg)
 		return
 	}
@@ -170,18 +205,33 @@ func copyAnthropicUpstreamHeaders(dst, src http.Header) {
 	}
 }
 
-// HandleCountTokens deliberately returns 404 so clients use a local estimate.
-// Returning a fabricated zero would cause unsafe context-window decisions.
+// HandleCountTokens returns a conservative local estimate. Grok Build does not
+// expose Anthropic's tokenizer, so this is intentionally an estimate, not zero.
 func (h *Handlers) HandleCountTokens(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		WriteError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	WriteError(w, http.StatusNotFound, "count_tokens is not implemented")
+	if !h.Cfg.CountTokens {
+		WriteError(w, http.StatusNotFound, "count_tokens is disabled")
+		return
+	}
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, h.maxBody()))
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, "failed to read body")
+		return
+	}
+	tokens := EstimateRawTokens(raw)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"input_tokens": tokens,
+		"estimate":     true,
+		"note":         "heuristic estimate (Grok Build has no Anthropic tokenizer)",
+	})
 }
 
 // sessionIDFromRequest extracts sticky conv id for Grok prompt cache.
-func sessionIDFromRequest(r *http.Request) string {
+func sessionIDFromRequest(r *http.Request, raw ...[]byte) string {
 	if r == nil {
 		return newSessionID()
 	}
@@ -195,7 +245,42 @@ func sessionIDFromRequest(r *http.Request) string {
 			return v
 		}
 	}
+	if len(raw) > 0 {
+		var probe struct {
+			Metadata struct {
+				UserID string `json:"user_id"`
+			} `json:"metadata"`
+		}
+		if json.Unmarshal(raw[0], &probe) == nil && strings.TrimSpace(probe.Metadata.UserID) != "" {
+			sum := sha256.Sum256([]byte(strings.TrimSpace(probe.Metadata.UserID)))
+			return "sess_meta_" + hex.EncodeToString(sum[:12])
+		}
+	}
 	return newSessionID()
+}
+
+func countStringBytes(value any) int {
+	switch v := value.(type) {
+	case string:
+		return len(v)
+	case []any:
+		total := 0
+		for _, item := range v {
+			total += countStringBytes(item)
+		}
+		return total
+	case map[string]any:
+		total := 0
+		for key, item := range v {
+			if key != "model" && key != "type" {
+				total += len(key)
+			}
+			total += countStringBytes(item)
+		}
+		return total
+	default:
+		return 0
+	}
 }
 
 func newSessionID() string {

@@ -13,16 +13,22 @@ type runtimeState struct {
 	CooldownUntil          time.Time
 	LastError              string
 	LastSuccessPersistedAt time.Time
-	Version                uint64
+	// Soft demotion after 429: lower pick preference without full cooldown exclusion.
+	DemoteUntil time.Time
+	DemoteScore int
+	Version     uint64
 }
 
 // cooldownDuration derives a cooldown window from HTTP status and history.
 //
 // Rules:
-//   - 429: Retry-After if > 0, else base * 2^failures capped at max, + jitter
-//   - 401/402/403: longer cooldown (402/403 use max)
-//   - 5xx: short cooldown (~base/10, floor 15s)
-//   - other: base
+//   - 429: Retry-After if > 0 (exact, no jitter), else base * 2^failures capped at max + jitter
+//   - 401/402/403: longer cooldown (402/403 use max; 402 honors Retry-After exactly)
+//   - 5xx: short cooldown (~base/10, floor 15s) + jitter
+//   - other: base + jitter
+//
+// Explicit retryAfter windows (server Retry-After or free-usage exhaustion) are
+// honored as-is so a 20h quota reset is not randomly stretched to ~22h.
 func (s *Selector) cooldownDuration(status int, retryAfter time.Duration, failures int) time.Duration {
 	base := s.cooldownBase
 	max := s.cooldownMax
@@ -37,10 +43,12 @@ func (s *Selector) cooldownDuration(status int, retryAfter time.Duration, failur
 	}
 
 	var d time.Duration
+	exact := false
 	switch {
 	case status == 429:
 		if retryAfter > 0 {
 			d = retryAfter
+			exact = true
 		} else {
 			shift := failures
 			if shift < 0 {
@@ -57,6 +65,7 @@ func (s *Selector) cooldownDuration(status int, retryAfter time.Duration, failur
 	case status == 402:
 		if retryAfter > 0 {
 			d = retryAfter
+			exact = true
 		} else {
 			d = max
 		}
@@ -79,6 +88,9 @@ func (s *Selector) cooldownDuration(status int, retryAfter time.Duration, failur
 		d = base
 	}
 
+	if exact {
+		return d
+	}
 	return d + jitter(d)
 }
 

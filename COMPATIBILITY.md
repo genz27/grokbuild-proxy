@@ -74,6 +74,7 @@ Reference semantics reviewed for this mapping:
 | Structured output JSON schema | Supported |
 | Native Grok `reasoning.encrypted_content` replay | Preserved verbatim |
 | `GET /v1/models` | Supported |
+| Claude Code `[1m]` model suffix | Supported: advertised on `/v1/models` with `context_window=1000000`; stripped in `ResolveModel` before alias mapping |
 | Chat audio, logprobs, `n>1` | Not supported |
 | Responses retrieve/delete/cancel/background/conversation APIs | Not supported |
 

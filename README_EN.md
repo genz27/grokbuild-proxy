@@ -97,7 +97,30 @@ export ANTHROPIC_MODEL=grok-4.5
 claude --effort high
 ```
 
-Configured Claude aliases can also be mapped to Grok models.
+Configured Claude aliases can also be mapped to Grok models via `anthropic.model_aliases`.
+
+### Claude Code 1M context
+
+Claude Code defaults model context to **200k**. Only model ids ending in `[1m]` get the **1M** context budget and auto-compact behavior (this is a Claude Code client convention, not a real upstream model name).
+
+This proxy:
+
+1. Exposes a sibling `claude-...[1m]` entry on `GET /v1/models` (`context_window=1000000`) for every Claude alias
+2. Strips `[1m]` in `ResolveModel` before alias mapping, so upstream still receives a normal Grok model id
+
+Long-session example:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
+export ANTHROPIC_AUTH_TOKEN="$(jq -r .api_key data/meta.json)"
+export ANTHROPIC_MODEL='claude-opus-4-6[1m]'
+
+claude --effort high
+```
+
+You can also pick the `(1M context)` entry in Claude Code's model selector.
+
+> Note: `[1m]` only changes Claude Code's local context budget. The real upstream window is still limited by the Grok model and proxy `anthropic.soft_input_tokens` / `max_input_tokens`. Keep `anthropic.auto_compact: true` for long sessions.
 
 ## OpenAI-compatible clients
 

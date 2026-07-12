@@ -142,6 +142,37 @@ func New(opts Options) http.Handler {
 		if opts.Version != "" {
 			opts.Admin.Version = opts.Version
 		}
+		if opts.Admin.Metrics == nil {
+			opts.Admin.Metrics = func() any { return metrics.Snapshot() }
+		} else {
+			extra := opts.Admin.Metrics
+			// Flatten HTTP counters to the top level so the admin UI can read
+			// metrics.requests / metrics.series directly. Path metrics remain
+			// nested under "extra" and are also promoted to "path" when present.
+			opts.Admin.Metrics = func() any {
+				snap := metrics.Snapshot()
+				out := map[string]any{
+					"requests":       snap.Requests,
+					"errors":         snap.Errors,
+					"successes":      snap.Successes,
+					"inflight":       snap.Inflight,
+					"response_bytes": snap.ResponseBytes,
+					"average_ms":     snap.AverageMS,
+					"series":         snap.Series,
+				}
+				if extra != nil {
+					if v := extra(); v != nil {
+						out["extra"] = v
+						if m, ok := v.(map[string]any); ok {
+							if path, ok := m["path"]; ok {
+								out["path"] = path
+							}
+						}
+					}
+				}
+				return out
+			}
+		}
 		mux.Handle("/admin/", opts.Admin.Handler())
 	}
 

@@ -41,32 +41,75 @@ type credentialsDoc struct {
 }
 
 // ListCredentials returns all credentials sorted by priority desc, then id.
+// Hot path clones an in-process cache without taking the disk flock.
 func (s *Store) ListCredentials() ([]Credential, error) {
+	if s == nil {
+		return nil, fmt.Errorf("storage: nil store")
+	}
+	s.mu.Lock()
+	if s.credCacheValid {
+		out := append([]Credential(nil), s.credCache...)
+		s.mu.Unlock()
+		return out, nil
+	}
+	s.mu.Unlock()
+
 	var out []Credential
 	err := s.withLock(func() error {
+		if s.credCacheValid {
+			out = append([]Credential(nil), s.credCache...)
+			return nil
+		}
 		doc, err := s.loadCredentials()
 		if err != nil {
 			return err
 		}
-		out = append([]Credential(nil), doc.Credentials...)
+		sorted := append([]Credential(nil), doc.Credentials...)
+		sort.SliceStable(sorted, func(i, j int) bool {
+			if sorted[i].Priority != sorted[j].Priority {
+				return sorted[i].Priority > sorted[j].Priority
+			}
+			return sorted[i].ID < sorted[j].ID
+		})
+		s.credCache = sorted
+		s.credCacheValid = true
+		out = append([]Credential(nil), sorted...)
 		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].Priority != out[j].Priority {
-			return out[i].Priority > out[j].Priority
-		}
-		return out[i].ID < out[j].ID
-	})
-	return out, nil
+	return out, err
 }
 
 // GetCredential returns a credential by id.
 func (s *Store) GetCredential(id string) (Credential, error) {
+	if s == nil {
+		return Credential{}, fmt.Errorf("storage: nil store")
+	}
+	s.mu.Lock()
+	if s.credCacheValid {
+		for _, c := range s.credCache {
+			if c.ID == id {
+				found := c
+				s.mu.Unlock()
+				return found, nil
+			}
+		}
+		s.mu.Unlock()
+		// Cache is authoritative when valid; missing means not found.
+		return Credential{}, fmt.Errorf("storage: credential %q not found", id)
+	}
+	s.mu.Unlock()
+
 	var found Credential
 	err := s.withLock(func() error {
+		if s.credCacheValid {
+			for _, c := range s.credCache {
+				if c.ID == id {
+					found = c
+					return nil
+				}
+			}
+			return fmt.Errorf("storage: credential %q not found", id)
+		}
 		doc, err := s.loadCredentials()
 		if err != nil {
 			return err
@@ -231,6 +274,100 @@ func (s *Store) UpsertCredential(in CreateCredentialInput) (Credential, bool, er
 	return result, created, err
 }
 
+// UpsertCredentialResult is one ordered result from UpsertCredentials.
+type UpsertCredentialResult struct {
+	Credential Credential
+	Created    bool
+}
+
+// UpsertCredentials imports a batch under one lock and persists it once. This
+// avoids rewriting the complete credential document for every imported account.
+func (s *Store) UpsertCredentials(inputs []CreateCredentialInput) ([]UpsertCredentialResult, error) {
+	results := make([]UpsertCredentialResult, 0, len(inputs))
+	if len(inputs) == 0 {
+		return results, nil
+	}
+	for _, in := range inputs {
+		if strings.TrimSpace(in.AccessToken) == "" && strings.TrimSpace(in.RefreshToken) == "" {
+			return nil, fmt.Errorf("storage: access_token or refresh_token required")
+		}
+	}
+	err := s.withLock(func() error {
+		doc, err := s.loadCredentials()
+		if err != nil {
+			return err
+		}
+		now := nowUTC()
+		for _, in := range inputs {
+			idx := -1
+			for i := range doc.Credentials {
+				if sameCredentialIdentity(doc.Credentials[i], in) {
+					idx = i
+					break
+				}
+			}
+			if idx >= 0 {
+				cur := doc.Credentials[idx]
+				mergeCredentialInput(&cur, in)
+				cur.UpdatedAt = now
+				doc.Credentials[idx] = cur
+				results = append(results, UpsertCredentialResult{Credential: cur})
+				continue
+			}
+			id, err := newID("cred")
+			if err != nil {
+				return err
+			}
+			enabled, priority := true, 100
+			if in.Enabled != nil {
+				enabled = *in.Enabled
+			}
+			if in.Priority != nil {
+				priority = *in.Priority
+			}
+			cur := Credential{ID: id, Enabled: enabled, Priority: priority, CreatedAt: now, UpdatedAt: now}
+			mergeCredentialInput(&cur, in)
+			doc.Credentials = append(doc.Credentials, cur)
+			results = append(results, UpsertCredentialResult{Credential: cur, Created: true})
+		}
+		return s.saveCredentials(doc)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
+func mergeCredentialInput(cur *Credential, in CreateCredentialInput) {
+	if in.Name != "" {
+		cur.Name = in.Name
+	}
+	if in.Email != "" {
+		cur.Email = in.Email
+	}
+	if in.UserID != "" {
+		cur.UserID = in.UserID
+	}
+	if in.TeamID != "" {
+		cur.TeamID = in.TeamID
+	}
+	if in.SourceKey != "" {
+		cur.SourceKey = in.SourceKey
+	}
+	if in.OIDCClientID != "" {
+		cur.OIDCClientID = in.OIDCClientID
+	}
+	if in.AccessToken != "" {
+		cur.AccessToken = in.AccessToken
+	}
+	if in.RefreshToken != "" {
+		cur.RefreshToken = in.RefreshToken
+	}
+	if !in.ExpiresAt.IsZero() {
+		cur.ExpiresAt = in.ExpiresAt.UTC().Truncate(time.Second)
+	}
+}
+
 func sameCredentialIdentity(c Credential, in CreateCredentialInput) bool {
 	if in.UserID != "" && c.UserID == in.UserID {
 		return in.TeamID == "" || c.TeamID == "" || c.TeamID == in.TeamID
@@ -380,6 +517,16 @@ func (s *Store) saveCredentials(doc credentialsDoc) error {
 	if doc.Credentials == nil {
 		doc.Credentials = []Credential{}
 	}
+	// Rebuild sorted cache in place so the next ListCredentials is a pure clone.
+	sorted := append([]Credential(nil), doc.Credentials...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		if sorted[i].Priority != sorted[j].Priority {
+			return sorted[i].Priority > sorted[j].Priority
+		}
+		return sorted[i].ID < sorted[j].ID
+	})
+	s.credCache = sorted
+	s.credCacheValid = true
 	return writeJSONFile(s.credentialsPath(), doc)
 }
 

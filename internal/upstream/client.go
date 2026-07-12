@@ -57,8 +57,11 @@ func NewClient(cfg Config) *Client {
 			Transport: &http.Transport{
 				Proxy:                 http.ProxyFromEnvironment,
 				ForceAttemptHTTP2:     true,
-				MaxIdleConns:          32,
-				IdleConnTimeout:       90 * time.Second,
+				// Sized for thousands of concurrent SSE streams against one upstream host.
+				MaxIdleConns:          4096,
+				MaxIdleConnsPerHost:   2048,
+				MaxConnsPerHost:       0,
+				IdleConnTimeout:       120 * time.Second,
 				TLSHandshakeTimeout:   10 * time.Second,
 				ResponseHeaderTimeout: timeout,
 				ExpectContinueTimeout: 1 * time.Second,

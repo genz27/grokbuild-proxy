@@ -107,6 +107,113 @@ textarea {
   gap: 14px;
 }
 
+.credential-list {
+  display: block;
+}
+
+.credential-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+  box-shadow: var(--shadow);
+}
+
+.credential-table {
+  width: 100%;
+  min-width: 1040px;
+  border-collapse: collapse;
+}
+
+.credential-table th,
+.credential-table td {
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.credential-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  color: var(--muted);
+  background: var(--bg-soft);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.credential-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.credential-table tbody tr:hover {
+  background: rgba(91, 140, 255, 0.06);
+}
+
+.credential-account strong,
+.credential-account small {
+  display: block;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.credential-table td > small {
+  display: block;
+  margin-top: 4px;
+}
+
+.table-priority,
+.table-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.table-priority input {
+  width: 68px;
+  min-height: 32px;
+  padding: 5px 7px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+.mono {
+  font-family: var(--mono);
+}
+
+.text-danger {
+  color: var(--danger);
+}
+
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.page-size {
+  min-height: 34px;
+  padding: 5px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elev);
+  color: var(--text);
+}
+
 .btn {
   appearance: none;
   border: 1px solid var(--border-strong);
@@ -773,3 +880,188 @@ td code {
     grid-template-columns: 1fr;
   }
 }
+
+
+/* Pool stats on credentials page */
+.pool-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.pool-stat-card {
+  padding: 12px 12px 10px;
+  border-radius: 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+}
+
+.pool-stat-card.tone-ok {
+  border-color: rgba(62, 207, 142, 0.35);
+  background: linear-gradient(180deg, rgba(62, 207, 142, 0.08), transparent 70%), var(--bg-elev);
+}
+
+.pool-stat-card.tone-warn {
+  border-color: rgba(240, 180, 41, 0.35);
+  background: linear-gradient(180deg, rgba(240, 180, 41, 0.08), transparent 70%), var(--bg-elev);
+}
+
+.pool-stat-card.tone-danger {
+  border-color: rgba(240, 113, 120, 0.35);
+  background: linear-gradient(180deg, rgba(240, 113, 120, 0.08), transparent 70%), var(--bg-elev);
+}
+
+.pool-stat-label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.pool-stat-value {
+  margin-top: 4px;
+  font-size: 22px;
+  font-weight: 750;
+  letter-spacing: -0.02em;
+}
+
+.pool-stat-meta {
+  grid-column: 1 / -1;
+  font-size: 12px;
+}
+
+/* System metrics panel */
+#system-metrics {
+  margin-bottom: 14px;
+}
+
+.metrics-section,
+.metrics-chart-card {
+  padding: 16px;
+}
+
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.metric-card {
+  padding: 12px;
+  border-radius: 10px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+}
+
+.metric-card.tone-ok {
+  border-color: rgba(62, 207, 142, 0.3);
+}
+
+.metric-card.tone-warn {
+  border-color: rgba(240, 180, 41, 0.3);
+}
+
+.metric-card.tone-danger {
+  border-color: rgba(240, 113, 120, 0.3);
+}
+
+.metric-value {
+  margin-top: 4px;
+  font-size: 20px;
+  font-weight: 750;
+}
+
+.chart-wrap {
+  margin-top: 8px;
+}
+
+.metrics-chart {
+  width: 100%;
+  height: auto;
+  display: block;
+  background: #080e19;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.chart-grid {
+  stroke: rgba(255, 255, 255, 0.06);
+  stroke-width: 1;
+}
+
+.chart-label {
+  fill: var(--muted);
+  font-size: 10px;
+  font-family: var(--mono);
+}
+
+.chart-line {
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.chart-req {
+  stroke: #7aa3ff;
+  opacity: 0.55;
+}
+
+.chart-ok {
+  stroke: var(--ok);
+}
+
+.chart-err {
+  stroke: var(--danger);
+}
+
+.chart-legend {
+  display: flex;
+  gap: 14px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.chart-legend span::before {
+  content: "";
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  margin-right: 6px;
+  vertical-align: -1px;
+}
+
+.chart-legend .lg-req::before { background: #7aa3ff; }
+.chart-legend .lg-ok::before { background: var(--ok); }
+.chart-legend .lg-err::before { background: var(--danger); }
+
+/* Secrets / keys panel */
+.secrets-panel {
+  padding: 16px;
+  margin-bottom: 14px;
+}
+
+.secrets-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.secrets-value {
+  flex: 1 1 280px;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  word-break: break-all;
+  background: #080e19;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 10px 12px;
+}
+
+.secrets-value.hidden-secret {
+  color: var(--muted);
+}
+

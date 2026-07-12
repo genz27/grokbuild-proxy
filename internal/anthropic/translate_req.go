@@ -14,6 +14,10 @@ type TranslateReqOptions struct {
 	ConvID string
 	// StripUnknownBetas drops unrecognized fields inside supported beta configs.
 	StripUnknownBetas bool
+	// PreserveCacheHints annotates cache_control blocks for continuity.
+	PreserveCacheHints bool
+	// MaxToolResultChars truncates tool_result text during conversion (0 disables).
+	MaxToolResultChars int
 }
 
 // Anthropic message request (subset used by Claude Code).
@@ -122,7 +126,7 @@ func TranslateRequest(raw []byte, opts TranslateReqOptions) (body []byte, origin
 
 	// messages → input
 	for _, m := range req.Messages {
-		items, convErr := convertMessage(m)
+		items, convErr := convertMessage(m, opts)
 		if convErr != nil {
 			return nil, originalModel, false, convErr
 		}
@@ -224,7 +228,7 @@ func extractSystemText(raw json.RawMessage) string {
 	return ""
 }
 
-func convertMessage(m anthropicMsg) ([]map[string]any, error) {
+func convertMessage(m anthropicMsg, opts TranslateReqOptions) ([]map[string]any, error) {
 	role := strings.ToLower(strings.TrimSpace(m.Role))
 	if role == "" {
 		role = "user"
@@ -281,6 +285,11 @@ func convertMessage(m anthropicMsg) ([]map[string]any, error) {
 		switch typ {
 		case "text", "":
 			t := rawString(bl["text"])
+			if opts.PreserveCacheHints {
+				if hint := cacheControlHint(bl["cache_control"]); hint != "" && t != "" {
+					t = t + "\n<!-- " + hint + " -->"
+				}
+			}
 			partType := "input_text"
 			if role == "assistant" {
 				partType = "output_text"
@@ -336,7 +345,10 @@ func convertMessage(m anthropicMsg) ([]map[string]any, error) {
 				callID = rawString(bl["id"])
 			}
 			output := toolResultOutput(bl["content"])
-			if rawString(bl["is_error"]) == "true" {
+			if opts.MaxToolResultChars > 0 {
+				output = TruncateToolResultText(output, opts.MaxToolResultChars)
+			}
+			if rawBool(bl["is_error"]) {
 				encoded, _ := json.Marshal(map[string]any{"is_error": true, "content": output})
 				output = string(encoded)
 			}
@@ -361,8 +373,7 @@ func convertMessage(m anthropicMsg) ([]map[string]any, error) {
 			// reasoning and cannot be replayed across providers.
 			continue
 		default:
-			// Unknown block types are dropped to avoid upstream 400s.
-			continue
+			return nil, fmt.Errorf("unsupported Anthropic content block type %q", typ)
 		}
 	}
 	flushText()
@@ -445,6 +456,11 @@ func rawString(r json.RawMessage) string {
 	return strings.Trim(string(r), `"`)
 }
 
+func rawBool(r json.RawMessage) bool {
+	var value bool
+	return json.Unmarshal(r, &value) == nil && value
+}
+
 func stripJSONField(raw json.RawMessage, field string) json.RawMessage {
 	if len(raw) == 0 {
 		return raw
@@ -462,4 +478,20 @@ func stripJSONField(raw json.RawMessage, field string) json.RawMessage {
 		return raw
 	}
 	return b
+}
+
+func cacheControlHint(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var obj struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(raw, &obj) != nil {
+		return "cache_control"
+	}
+	if strings.TrimSpace(obj.Type) == "" {
+		return "cache_control"
+	}
+	return "cache_control:" + strings.TrimSpace(obj.Type)
 }
