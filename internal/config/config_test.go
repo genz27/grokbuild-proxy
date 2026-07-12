@@ -74,11 +74,11 @@ func TestDefaultAlignedWithPlan(t *testing.T) {
 		"claude-opus-4-6":   "grok-4.5",
 		"claude-opus-4-7":   "grok-4.5",
 		"claude-opus-4-8":   "grok-4.5",
-		"claude-haiku-4":    "grok-composer-2.5-fast",
-		"claude-haiku-4-5":  "grok-composer-2.5-fast",
+		"claude-haiku-4":    "grok-4.5",
+		"claude-haiku-4-5":  "grok-4.5",
 		"sonnet":            "grok-4.5",
 		"opus":              "grok-4.5",
-		"haiku":             "grok-composer-2.5-fast",
+		"haiku":             "grok-4.5",
 	}
 	for k, v := range wantAliases {
 		if got := cfg.Anthropic.ModelAliases[k]; got != v {

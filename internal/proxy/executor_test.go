@@ -830,6 +830,84 @@ func TestExecutorPostFailoverOnFreeUsageExhausted(t *testing.T) {
 	}
 }
 
+
+func TestIsSpendingLimitBody(t *testing.T) {
+	cases := []struct {
+		body string
+		want bool
+	}{
+		{`{"error":{"code":"personal-team-blocked:spending-limit","message":"You have run out of credits. You need a Grok subscription to continue."}}`, true},
+		{`personal-team-blocked:spending-limit`, true},
+		{`You have run out of credits`, true},
+		{`{"error":{"code":"subscription:free-usage-exhausted","message":"You've used all the included free usage for model grok-4.5-build-free for now."}}`, false},
+		{`{"error":{"message":"quota exhausted"}}`, false},
+		{`{"error":"rate limit, try again soon"}`, false},
+		{``, false},
+	}
+	for _, tc := range cases {
+		if got := isSpendingLimitBody(tc.body); got != tc.want {
+			t.Fatalf("body=%q got=%v want=%v", tc.body, got, tc.want)
+		}
+	}
+}
+
+func TestExecutorPostSpendingLimitDoesNotFailoverOrPoison(t *testing.T) {
+	var mu sync.Mutex
+	hits := map[string]int{}
+	bodyA := `{"error":{"code":"personal-team-blocked:spending-limit","message":"You have run out of credits. You need a Grok subscription to continue."}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authz := r.Header.Get("Authorization")
+		mu.Lock()
+		hits[authz]++
+		mu.Unlock()
+		// Both accounts would hit the same model-level spending gate if we failed over.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = w.Write([]byte(bodyA))
+	}))
+	t.Cleanup(srv.Close)
+
+	now := time.Date(2026, 7, 12, 7, 0, 0, 0, time.UTC)
+	sel := lb.New(config.LBConfig{Strategy: "priority_rr", Cooldown: config.CooldownConfig{BaseSec: 300, MaxSec: 3600}})
+	store := newMemStore(
+		storage.Credential{ID: "cred_a", AccessToken: "token-a", Enabled: true, Priority: 200},
+		storage.Credential{ID: "cred_b", AccessToken: "token-b", Enabled: true, Priority: 100},
+	)
+	ex := &Executor{
+		Store:       store,
+		Selector:    sel,
+		Upstream:    upstream.NewClient(upstream.Config{BaseURL: srv.URL + "/v1", HTTPClient: srv.Client()}),
+		Refresher:   passthroughRefresher{},
+		MaxAttempts: 4,
+		Now:         func() time.Time { return now },
+	}
+	resp, err := ex.Post(context.Background(), "grok-composer-2.5-fast", "", []byte(`{"model":"grok-composer-2.5-fast"}`), false)
+	if err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusPaymentRequired {
+		t.Fatalf("status=%d body=%s hits=%v", resp.StatusCode, raw, hits)
+	}
+	if !strings.Contains(string(raw), "personal-team-blocked:spending-limit") {
+		t.Fatalf("body=%s", raw)
+	}
+	// Fail-fast: only the first credential is tried.
+	if hits["Bearer token-a"] != 1 || hits["Bearer token-b"] != 0 {
+		t.Fatalf("expected single attempt on first credential, hits=%v", hits)
+	}
+
+	// Account must remain pickable — spending-limit must not poison free-tier pools.
+	picked, err := sel.Pick(mustList(store), "", now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("Pick after spending-limit: %v", err)
+	}
+	if picked.ID != "cred_a" {
+		t.Fatalf("expected cred_a still healthy after spending-limit, got %s", picked.ID)
+	}
+}
+
 func mustList(store Store) []storage.Credential {
 	creds, err := store.ListCredentials()
 	if err != nil {

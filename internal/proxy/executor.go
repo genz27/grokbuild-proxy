@@ -99,9 +99,10 @@ type Executor struct {
 
 // Post implements openai.PostResponsesFunc / anthropic.PostResponsesFunc.
 //
-// It may switch credentials on 401/429/5xx only before the response is returned
-// to the caller (body not yet delivered). After a successful 2xx, MarkSuccess is
-// recorded. 426 is never failed-over; the original response is returned.
+// It may switch credentials on 401/429/5xx/402 only before the response is
+// returned to the caller (body not yet delivered). After a successful 2xx,
+// MarkSuccess is recorded. 426 is never failed-over. 402 spending-limit is
+// returned immediately without credential poison or further failover.
 func (e *Executor) Post(ctx context.Context, model, convID string, body []byte, stream bool) (*http.Response, error) {
 	if e == nil {
 		return nil, fmt.Errorf("proxy: nil executor")
@@ -355,22 +356,10 @@ func (e *Executor) Post(ctx context.Context, model, convID string, body []byte, 
 			ra := parseRetryAfterAt(retry.Header.Get("Retry-After"), e.now())
 			status := retry.StatusCode
 			lastResp = bufferErrorResponse(retry)
-			freeExhausted := isFreeUsageExhaustedResponse(lastResp)
-			if freeExhausted {
-				if freeCD := e.freeUsageExhaustedDuration(); freeCD > ra {
-					ra = freeCD
-				}
+			if handle := e.handleRetryableFailure(ctx, cred.ID, attempt+1, status, ra, lastResp, "after refresh"); handle == retryDecisionReturn {
+				return lastResp, nil
 			}
-			e.Selector.MarkFailure(cred.ID, status, ra, e.now())
-			e.log(ctx, slog.LevelWarn, "upstream_retryable_status",
-				"credential_id", cred.ID,
-				"attempt", attempt+1,
-				"upstream_status", status,
-				"retry_after_ms", ra.Milliseconds(),
-				"free_usage_exhausted", freeExhausted,
-			)
 			lastErr = fmt.Errorf("proxy: upstream status %d after refresh", status)
-			e.observeFailover()
 			continue
 		}
 
@@ -379,22 +368,10 @@ func (e *Executor) Post(ctx context.Context, model, convID string, body []byte, 
 			ra := parseRetryAfterAt(resp.Header.Get("Retry-After"), e.now())
 			status := resp.StatusCode
 			lastResp = bufferErrorResponse(resp)
-			freeExhausted := isFreeUsageExhaustedResponse(lastResp)
-			if freeExhausted {
-				if freeCD := e.freeUsageExhaustedDuration(); freeCD > ra {
-					ra = freeCD
-				}
+			if handle := e.handleRetryableFailure(ctx, cred.ID, attempt+1, status, ra, lastResp, ""); handle == retryDecisionReturn {
+				return lastResp, nil
 			}
-			e.Selector.MarkFailure(cred.ID, status, ra, e.now())
-			e.log(ctx, slog.LevelWarn, "upstream_retryable_status",
-				"credential_id", cred.ID,
-				"attempt", attempt+1,
-				"upstream_status", status,
-				"retry_after_ms", ra.Milliseconds(),
-				"free_usage_exhausted", freeExhausted,
-			)
 			lastErr = fmt.Errorf("proxy: upstream status %d", status)
-			e.observeFailover()
 			continue
 		}
 
@@ -1018,6 +995,84 @@ func isFreeUsageExhaustedBody(body string) bool {
 		"free tier usage exhausted",
 		"included free usage",
 		"subscription:free-usage-exhausted",
+	}
+	for _, m := range markers {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
+}
+
+type retryDecision int
+
+const (
+	retryDecisionContinue retryDecision = iota
+	retryDecisionReturn
+)
+
+// handleRetryableFailure classifies buffered upstream errors and either cools
+// the credential (continue failover) or returns immediately.
+//
+// personal-team-blocked:spending-limit is a model/billing gate, not an account
+// health signal for free-tier pools. Fail over across free accounts burns
+// latency and poisons healthy credentials with a 1h 402 cooldown, so we return
+// the original 402 without MarkFailure.
+func (e *Executor) handleRetryableFailure(ctx context.Context, credID string, attempt, status int, ra time.Duration, resp *http.Response, note string) retryDecision {
+	freeExhausted := isFreeUsageExhaustedResponse(resp)
+	spendingLimit := isSpendingLimitResponse(resp)
+	if freeExhausted {
+		if freeCD := e.freeUsageExhaustedDuration(); freeCD > ra {
+			ra = freeCD
+		}
+	}
+	if spendingLimit {
+		e.log(ctx, slog.LevelWarn, "upstream_spending_limit",
+			"credential_id", credID,
+			"attempt", attempt,
+			"upstream_status", status,
+			"note", note,
+		)
+		// Model-level billing gate: do not cool the credential or cascade.
+		return retryDecisionReturn
+	}
+	e.Selector.MarkFailure(credID, status, ra, e.now())
+	e.log(ctx, slog.LevelWarn, "upstream_retryable_status",
+		"credential_id", credID,
+		"attempt", attempt,
+		"upstream_status", status,
+		"retry_after_ms", ra.Milliseconds(),
+		"free_usage_exhausted", freeExhausted,
+		"note", note,
+	)
+	e.observeFailover()
+	return retryDecisionContinue
+}
+
+// isSpendingLimitResponse reports whether an upstream error body indicates a
+// paid-model / team spending gate (HTTP 402 personal-team-blocked:spending-limit).
+func isSpendingLimitResponse(resp *http.Response) bool {
+	if resp == nil || resp.Body == nil {
+		return false
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil && len(raw) == 0 {
+		return false
+	}
+	resp.Body = io.NopCloser(strings.NewReader(string(raw)))
+	resp.ContentLength = int64(len(raw))
+	return isSpendingLimitBody(string(raw))
+}
+
+func isSpendingLimitBody(body string) bool {
+	lower := strings.ToLower(body)
+	markers := []string{
+		"personal-team-blocked:spending-limit",
+		"personal_team_blocked:spending_limit",
+		"spending-limit",
+		"spending_limit",
+		"run out of credits",
+		"need a grok subscription",
 	}
 	for _, m := range markers {
 		if strings.Contains(lower, m) {
