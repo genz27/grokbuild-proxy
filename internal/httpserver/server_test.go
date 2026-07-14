@@ -360,26 +360,8 @@ func TestCredentialsNotServedAsHTML(t *testing.T) {
 	}
 }
 
-func TestAdminRejectsUntrustedHostWithoutTrustingForwardedHost(t *testing.T) {
+func TestAdminAllowsAnyHostAndLeavesPublicAPIUnchanged(t *testing.T) {
 	cfg := config.Default()
-	cfg.AdminTrustedHosts = []string{"admin.example.test"}
-	h := New(Options{Config: cfg, AdminKey: "sk-admin-good", Admin: &admin.Handlers{}})
-
-	for _, path := range []string{"/admin", "/admin/ui/app.js", "/admin/system"} {
-		req := httptest.NewRequest(http.MethodGet, path, nil)
-		req.Host = "attacker.example.test:8080"
-		req.Header.Set("X-Forwarded-Host", "admin.example.test")
-		rr := httptest.NewRecorder()
-		h.ServeHTTP(rr, req)
-		if rr.Code != http.StatusMisdirectedRequest {
-			t.Fatalf("%s status=%d body=%s want 421", path, rr.Code, rr.Body.String())
-		}
-	}
-}
-
-func TestAdminAllowsExplicitTrustedHostAndLeavesPublicAPIUnchanged(t *testing.T) {
-	cfg := config.Default()
-	cfg.AdminTrustedHosts = []string{"Admin.Example.Test."}
 	h := New(Options{Config: cfg, AdminKey: "sk-admin-good", Admin: &admin.Handlers{}})
 
 	adminReq := httptest.NewRequest(http.MethodGet, "/admin", nil)
@@ -387,7 +369,7 @@ func TestAdminAllowsExplicitTrustedHostAndLeavesPublicAPIUnchanged(t *testing.T)
 	adminRR := httptest.NewRecorder()
 	h.ServeHTTP(adminRR, adminReq)
 	if adminRR.Code != http.StatusOK {
-		t.Fatalf("trusted admin status=%d body=%s", adminRR.Code, adminRR.Body.String())
+		t.Fatalf("admin status=%d body=%s", adminRR.Code, adminRR.Body.String())
 	}
 
 	healthReq := httptest.NewRequest(http.MethodGet, "/healthz", nil)

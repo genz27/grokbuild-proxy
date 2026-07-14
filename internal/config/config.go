@@ -208,11 +208,11 @@ func Default() Config {
 				// Free-tier pools only reliably reach grok-4.5 (upstream maps to
 				// grok-4.5-build-free). Paid models like grok-composer-2.5-fast return
 				// 402 personal-team-blocked:spending-limit on free accounts.
-				"claude-haiku-4":    "grok-4.5",
-				"claude-haiku-4-5":  "grok-4.5",
-				"sonnet":            "grok-4.5",
-				"opus":              "grok-4.5",
-				"haiku":             "grok-4.5",
+				"claude-haiku-4":   "grok-4.5",
+				"claude-haiku-4-5": "grok-4.5",
+				"sonnet":           "grok-4.5",
+				"opus":             "grok-4.5",
+				"haiku":            "grok-4.5",
 			},
 			PassthroughPrefixes: []string{"grok-"},
 			StripUnknownBetas:   true,

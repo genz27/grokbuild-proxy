@@ -830,7 +830,6 @@ func TestExecutorPostFailoverOnFreeUsageExhausted(t *testing.T) {
 	}
 }
 
-
 func TestIsSpendingLimitBody(t *testing.T) {
 	cases := []struct {
 		body string

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -182,45 +181,7 @@ func New(opts Options) http.Handler {
 		mux.Handle("/admin/", opts.Admin.Handler())
 	}
 
-	return requireTrustedAdminHost(mw.Observe(mw.Timeout(mux)), opts.Config)
-}
-
-func requireTrustedAdminHost(next http.Handler, cfg config.Config) http.Handler {
-	trusted := make(map[string]struct{}, len(cfg.AdminTrustedHosts)+4)
-	trusted["localhost"] = struct{}{}
-	for _, raw := range cfg.AdminTrustedHosts {
-		if host, err := config.NormalizeTrustedHost(raw); err == nil {
-			trusted[host] = struct{}{}
-		}
-	}
-	if listenHost, _, err := net.SplitHostPort(strings.TrimSpace(cfg.Listen)); err == nil {
-		listenHost = strings.Trim(listenHost, "[]")
-		if listenHost != "" && listenHost != "0.0.0.0" && listenHost != "::" {
-			if host, normalizeErr := config.NormalizeTrustedHost(listenHost); normalizeErr == nil {
-				trusted[host] = struct{}{}
-			}
-		}
-	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/admin" && !strings.HasPrefix(r.URL.Path, "/admin/") {
-			next.ServeHTTP(w, r)
-			return
-		}
-		host, err := config.NormalizeTrustedHost(r.Host)
-		if err != nil {
-			http.Error(w, "misdirected admin request", http.StatusMisdirectedRequest)
-			return
-		}
-		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
-			next.ServeHTTP(w, r)
-			return
-		}
-		if _, ok := trusted[host]; !ok {
-			http.Error(w, "misdirected admin request", http.StatusMisdirectedRequest)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+	return mw.Observe(mw.Timeout(mux))
 }
 
 // NewServer builds an *http.Server with sensible timeouts.
