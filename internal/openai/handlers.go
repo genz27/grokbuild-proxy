@@ -3,10 +3,12 @@ package openai
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
+	"github.com/GreyGunG/grokbuild-proxy/internal/anthropic"
 	"github.com/GreyGunG/grokbuild-proxy/internal/lb"
 )
 
@@ -32,6 +34,12 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	raw, err = h.applyContextGuard(w, raw)
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "context_too_long")
+		return
+	}
+
 	convHint := convIDFromRequest(r, extractBodyConvID(raw))
 	res, err := SanitizeResponses(raw, convHint)
 	if err != nil {
@@ -41,6 +49,11 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	sanitized, err := marshalBody(res.Body)
 	if err != nil {
 		WriteError(w, http.StatusInternalServerError, "failed to encode request", "server_error", "encode_error")
+		return
+	}
+	sanitized, err = h.applyContextGuard(w, sanitized)
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "context_too_long")
 		return
 	}
 
@@ -55,7 +68,27 @@ func (h *Handlers) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if res.Stream || isSSEContentType(resp.Header.Get("Content-Type")) {
+		if resp.StatusCode >= 400 {
+			rawErr, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			_ = resp.Body.Close()
+			if anthropic.IsContextTooLongMessage(string(rawErr)) {
+				WriteError(w, http.StatusBadRequest, "context_too_long: "+trimErr(rawErr)+"; try a new session or smaller tool outputs", "invalid_request_error", "context_too_long")
+				return
+			}
+			MapUpstreamError(w, resp.StatusCode, rawErr)
+			return
+		}
 		streamUpstreamSSE(w, resp)
+		return
+	}
+	if resp.StatusCode >= 400 {
+		rawErr, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+		if anthropic.IsContextTooLongMessage(string(rawErr)) {
+			WriteError(w, http.StatusBadRequest, "context_too_long: "+trimErr(rawErr)+"; try a new session or smaller tool outputs", "invalid_request_error", "context_too_long")
+			return
+		}
+		MapUpstreamError(w, resp.StatusCode, rawErr)
 		return
 	}
 	proxyUpstreamJSON(w, resp)
@@ -84,6 +117,13 @@ func (h *Handlers) HandleChatCompletions(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Compact chat history before conversion so huge tool dumps never reach upstream.
+	raw, err = h.applyContextGuard(w, raw)
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "context_too_long")
+		return
+	}
+
 	body, err := ChatToResponses(raw)
 	if err != nil {
 		WriteError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "invalid_body")
@@ -99,6 +139,11 @@ func (h *Handlers) HandleChatCompletions(w http.ResponseWriter, r *http.Request)
 	sanitized, err := marshalBody(sanitizedRes.Body)
 	if err != nil {
 		WriteError(w, http.StatusInternalServerError, "failed to encode request", "server_error", "encode_error")
+		return
+	}
+	sanitized, err = h.applyContextGuard(w, sanitized)
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "context_too_long")
 		return
 	}
 
@@ -132,6 +177,10 @@ func (h *Handlers) HandleChatCompletions(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if anthropic.IsContextTooLongMessage(string(upRaw)) {
+			WriteError(w, http.StatusBadRequest, "context_too_long: "+trimErr(upRaw)+"; try a new session or smaller tool outputs", "invalid_request_error", "context_too_long")
+			return
+		}
 		MapUpstreamError(w, resp.StatusCode, upRaw)
 		return
 	}
@@ -158,10 +207,47 @@ func writePostError(w http.ResponseWriter, err error) {
 	WriteError(w, http.StatusBadGateway, "upstream request failed: "+err.Error(), "server_error", "upstream_error")
 }
 
+func (h *Handlers) applyContextGuard(w http.ResponseWriter, raw []byte) ([]byte, error) {
+	if h == nil || h.ContextGuard == nil || len(raw) == 0 {
+		return raw, nil
+	}
+	prepared, compact, err := anthropic.PrepareOpenAIBody(raw, *h.ContextGuard)
+	if compact.Applied {
+		w.Header().Set("X-Grokbuild-Context-Compact", "1")
+		if compact.DroppedMessages > 0 {
+			w.Header().Set("X-Grokbuild-Dropped-Messages", fmt.Sprintf("%d", compact.DroppedMessages))
+		}
+		if compact.TruncatedToolResults > 0 {
+			w.Header().Set("X-Grokbuild-Truncated-Tool-Results", fmt.Sprintf("%d", compact.TruncatedToolResults))
+		}
+		w.Header().Set("X-Grokbuild-Input-Tokens-Before", fmt.Sprintf("%d", compact.EstimatedBefore))
+		w.Header().Set("X-Grokbuild-Input-Tokens-After", fmt.Sprintf("%d", compact.EstimatedAfter))
+	}
+	if err != nil {
+		return prepared, err
+	}
+	return prepared, nil
+}
+
+func trimErr(raw []byte) string {
+	msg := strings.TrimSpace(string(raw))
+	if msg == "" {
+		return "upstream context overflow"
+	}
+	if len(msg) > 800 {
+		return msg[:800]
+	}
+	return msg
+}
+
 func handleChatStream(w http.ResponseWriter, resp *http.Response, includeUsage bool) {
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if anthropic.IsContextTooLongMessage(string(raw)) {
+			WriteError(w, http.StatusBadRequest, "context_too_long: "+trimErr(raw)+"; try a new session or smaller tool outputs", "invalid_request_error", "context_too_long")
+			return
+		}
 		MapUpstreamError(w, resp.StatusCode, raw)
 		return
 	}

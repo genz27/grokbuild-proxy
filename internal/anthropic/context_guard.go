@@ -61,7 +61,7 @@ func estimateValueTokens(value any) int {
 		total := 0
 		for key, item := range v {
 			switch key {
-			case "model", "stream", "temperature", "top_p", "top_k":
+			case "model", "stream", "temperature", "top_p", "top_k", "n", "logprobs":
 				continue
 			case "cache_control":
 				total += 2
@@ -117,6 +117,7 @@ func EstimateRawTokens(raw []byte) int {
 		tokens = estimateStringTokens(string(raw))
 	}
 	// Conservative floor for code/log-heavy payloads.
+	// Upstream counts closer to ~1 token / 3-4 bytes for mixed JSON+code.
 	byteFloor := (len(raw) + 2) / 3
 	if byteFloor > tokens {
 		tokens = byteFloor
@@ -127,16 +128,33 @@ func EstimateRawTokens(raw []byte) int {
 	return tokens
 }
 
-// PrepareAnthropicBody runs tool truncation + auto-compact + hard guard.
+// PrepareAnthropicBody runs tool truncation + auto-compact + hard guard for Anthropic Messages bodies.
 func PrepareAnthropicBody(raw []byte, cfg ContextGuardConfig) (out []byte, result CompactResult, err error) {
+	return prepareBody(raw, cfg, bodyShapeAnthropic)
+}
+
+// PrepareOpenAIBody runs the same guard for OpenAI chat.completions or Responses bodies.
+// It accepts either messages[] (chat) or input[] (Responses).
+func PrepareOpenAIBody(raw []byte, cfg ContextGuardConfig) (out []byte, result CompactResult, err error) {
+	return prepareBody(raw, cfg, bodyShapeOpenAI)
+}
+
+type bodyShape int
+
+const (
+	bodyShapeAnthropic bodyShape = iota
+	bodyShapeOpenAI
+)
+
+func prepareBody(raw []byte, cfg ContextGuardConfig, shape bodyShape) (out []byte, result CompactResult, err error) {
 	before := EstimateRawTokens(raw)
 	result.EstimatedBefore = before
 	out = append([]byte(nil), raw...)
 
-	// Always leave headroom under common 500k upstream limit.
+	// Leave headroom under the common 500k upstream hard limit.
 	safetyTarget := cfg.SoftInputTokens
-	if safetyTarget <= 0 || safetyTarget > 470000 {
-		safetyTarget = 470000
+	if safetyTarget <= 0 || safetyTarget > 450000 {
+		safetyTarget = 450000
 	}
 	if cfg.MaxInputTokens > 0 && cfg.MaxInputTokens < safetyTarget {
 		safetyTarget = cfg.MaxInputTokens
@@ -144,8 +162,10 @@ func PrepareAnthropicBody(raw []byte, cfg ContextGuardConfig) (out []byte, resul
 
 	toolBudget := cfg.MaxToolResultChars
 	if toolBudget <= 0 {
-		toolBudget = 120000
+		toolBudget = 80000
 	}
+
+	// Always truncate oversized tool results first (cheap and high impact).
 	if rewritten, n, terr := truncateToolResultsInBody(out, toolBudget); terr == nil && n > 0 {
 		out = rewritten
 		result.TruncatedToolResults += n
@@ -155,9 +175,9 @@ func PrepareAnthropicBody(raw []byte, cfg ContextGuardConfig) (out []byte, resul
 	if cfg.AutoCompact {
 		keep := cfg.KeepRecentMessages
 		if keep <= 0 {
-			keep = 16
+			keep = 12
 		}
-		for attempt := 0; attempt < 12 && EstimateRawTokens(out) > safetyTarget; attempt++ {
+		for attempt := 0; attempt < 16 && EstimateRawTokens(out) > safetyTarget; attempt++ {
 			rewritten, dropped, note, cerr := compactMessagesBody(out, keep)
 			if cerr == nil && (dropped > 0 || len(rewritten) != len(out)) {
 				out = rewritten
@@ -165,10 +185,11 @@ func PrepareAnthropicBody(raw []byte, cfg ContextGuardConfig) (out []byte, resul
 				result.Note = note
 				result.Applied = true
 			}
-			if toolBudget > 3000 {
+
+			if toolBudget > 2000 {
 				toolBudget = toolBudget * 2 / 3
-				if toolBudget < 3000 {
-					toolBudget = 3000
+				if toolBudget < 2000 {
+					toolBudget = 2000
 				}
 			}
 			if rewritten, n, terr := truncateToolResultsInBody(out, toolBudget); terr == nil && n > 0 {
@@ -180,13 +201,42 @@ func PrepareAnthropicBody(raw []byte, cfg ContextGuardConfig) (out []byte, resul
 				out = rewritten
 				result.Applied = true
 			}
+			// Shrink tool definitions / instructions when message history alone is not enough.
+			if rewritten, n, terr := truncateToolsInBody(out, toolBudget); terr == nil && n > 0 {
+				out = rewritten
+				result.Applied = true
+			}
+			if rewritten, n, terr := truncateInstructionsInBody(out, toolBudget); terr == nil && n > 0 {
+				out = rewritten
+				result.Applied = true
+			}
+
 			if keep > 2 {
 				next := keep * 2 / 3
 				if next < 2 {
 					next = 2
 				}
 				keep = next
+			} else if keep > 1 {
+				keep = 1
 			}
+
+			// Last-resort: drop all but the newest message + a compact notice.
+			if attempt >= 10 && EstimateRawTokens(out) > safetyTarget {
+				if rewritten, dropped, note, cerr := compactMessagesBody(out, 1); cerr == nil && dropped > 0 {
+					out = rewritten
+					result.DroppedMessages += dropped
+					result.Note = note
+					result.Applied = true
+				}
+			}
+			_ = shape
+		}
+	} else {
+		// Even without auto-compact, still clamp giant tool outputs once.
+		if rewritten, n, terr := truncateLargeTextBlocks(out, toolBudget); terr == nil && n > 0 {
+			out = rewritten
+			result.Applied = true
 		}
 	}
 
@@ -201,13 +251,27 @@ func PrepareAnthropicBody(raw []byte, cfg ContextGuardConfig) (out []byte, resul
 	return out, result, nil
 }
 
+func messageArrayKey(root map[string]json.RawMessage) string {
+	if _, ok := root["messages"]; ok {
+		return "messages"
+	}
+	if _, ok := root["input"]; ok {
+		return "input"
+	}
+	return ""
+}
+
 func truncateToolResultsInBody(raw []byte, maxChars int) ([]byte, int, error) {
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &root); err != nil {
 		return raw, 0, err
 	}
-	msgRaw, ok := root["messages"]
-	if !ok || len(msgRaw) == 0 {
+	key := messageArrayKey(root)
+	if key == "" {
+		return raw, 0, nil
+	}
+	msgRaw := root[key]
+	if len(msgRaw) == 0 {
 		return raw, 0, nil
 	}
 	var messages []map[string]json.RawMessage
@@ -216,6 +280,33 @@ func truncateToolResultsInBody(raw []byte, maxChars int) ([]byte, int, error) {
 	}
 	changed := 0
 	for i := range messages {
+		// OpenAI tool role messages: role=tool, content=string|array
+		if role := rawString(messages[i]["role"]); role == "tool" || role == "function" {
+			if contentRaw, ok := messages[i]["content"]; ok {
+				if newContent, did, err := truncateToolResultContent(contentRaw, maxChars); err == nil && did {
+					messages[i]["content"] = newContent
+					changed++
+				}
+			}
+			continue
+		}
+		// OpenAI Responses function_call_output items.
+		if typ := rawString(messages[i]["type"]); typ == "function_call_output" || typ == "tool_result" {
+			if outRaw, ok := messages[i]["output"]; ok {
+				if newOut, did, err := truncateToolResultContent(outRaw, maxChars); err == nil && did {
+					messages[i]["output"] = newOut
+					changed++
+				}
+			}
+			if contentRaw, ok := messages[i]["content"]; ok {
+				if newContent, did, err := truncateToolResultContent(contentRaw, maxChars); err == nil && did {
+					messages[i]["content"] = newContent
+					changed++
+				}
+			}
+			continue
+		}
+
 		contentRaw, ok := messages[i]["content"]
 		if !ok {
 			continue
@@ -224,22 +315,30 @@ func truncateToolResultsInBody(raw []byte, maxChars int) ([]byte, int, error) {
 		if err := json.Unmarshal(contentRaw, &blocks); err != nil {
 			var s string
 			if json.Unmarshal(contentRaw, &s) == nil && len(s) > maxChars {
-				ns := TruncateToolResultText(s, maxChars)
-				b, err := json.Marshal(ns)
-				if err == nil {
-					messages[i]["content"] = b
-					changed++
-				}
+				// Only auto-truncate plain string content when role looks tool-like,
+				// otherwise leave to truncateLargeTextBlocks.
+				continue
 			}
 			continue
 		}
 		blockChanged := false
 		for j := range blocks {
-			if rawString(blocks[j]["type"]) != "tool_result" {
+			typ := rawString(blocks[j]["type"])
+			if typ != "tool_result" && typ != "function_call_output" {
+				// OpenAI chat tool_calls are not results; skip.
+				// Anthropic tool_result lives in content blocks.
 				continue
 			}
 			newContent, did, err := truncateToolResultContent(blocks[j]["content"], maxChars)
 			if err != nil || !did {
+				// Some shapes put payload in "output".
+				if outRaw, ok := blocks[j]["output"]; ok {
+					if newOut, did2, err2 := truncateToolResultContent(outRaw, maxChars); err2 == nil && did2 {
+						blocks[j]["output"] = newOut
+						blockChanged = true
+						changed++
+					}
+				}
 				continue
 			}
 			blocks[j]["content"] = newContent
@@ -261,7 +360,7 @@ func truncateToolResultsInBody(raw []byte, maxChars int) ([]byte, int, error) {
 	if err != nil {
 		return raw, 0, err
 	}
-	root["messages"] = mb
+	root[key] = mb
 	out, err := json.Marshal(root)
 	if err != nil {
 		return raw, 0, err
@@ -278,33 +377,56 @@ func truncateLargeTextBlocks(raw []byte, maxChars int) ([]byte, int, error) {
 		return raw, 0, err
 	}
 	changed := 0
-	if sys, ok := root["system"]; ok {
-		if ns, did, err := truncateAnyTextField(sys, maxChars); err == nil && did {
-			root["system"] = ns
-			changed++
+	for _, field := range []string{"system", "instructions"} {
+		if sys, ok := root[field]; ok {
+			if ns, did, err := truncateAnyTextField(sys, maxChars); err == nil && did {
+				root[field] = ns
+				changed++
+			}
 		}
 	}
-	msgRaw, ok := root["messages"]
-	if !ok {
+	key := messageArrayKey(root)
+	if key == "" {
 		if changed == 0 {
 			return raw, 0, nil
 		}
 		out, err := json.Marshal(root)
 		return out, changed, err
 	}
+	msgRaw := root[key]
 	var messages []map[string]json.RawMessage
 	if err := json.Unmarshal(msgRaw, &messages); err != nil {
 		return raw, changed, err
 	}
 	for i := range messages {
+		// Prefer truncating bulky assistant/user text; always clamp tool payloads.
+		role := rawString(messages[i]["role"])
+		typ := rawString(messages[i]["type"])
+		isToolish := role == "tool" || role == "function" || typ == "function_call_output" || typ == "tool_result"
+
+		if outRaw, ok := messages[i]["output"]; ok && isToolish {
+			if ns, did, err := truncateAnyTextField(outRaw, maxChars); err == nil && did {
+				messages[i]["output"] = ns
+				changed++
+			}
+		}
+
 		contentRaw, ok := messages[i]["content"]
 		if !ok {
 			continue
 		}
 		var s string
 		if json.Unmarshal(contentRaw, &s) == nil {
-			if len(s) > maxChars {
-				b, err := json.Marshal(TruncateToolResultText(s, maxChars))
+			limit := maxChars
+			if !isToolish {
+				// Keep user/assistant plain text larger than tool dumps.
+				limit = maxChars * 2
+				if limit < maxChars {
+					limit = maxChars
+				}
+			}
+			if len(s) > limit {
+				b, err := json.Marshal(TruncateToolResultText(s, limit))
 				if err == nil {
 					messages[i]["content"] = b
 					changed++
@@ -318,15 +440,46 @@ func truncateLargeTextBlocks(raw []byte, maxChars int) ([]byte, int, error) {
 		}
 		blockChanged := false
 		for j := range blocks {
-			typ := rawString(blocks[j]["type"])
-			if typ != "text" && typ != "" {
+			btype := rawString(blocks[j]["type"])
+			if btype == "tool_result" || btype == "function_call_output" {
+				if newContent, did, err := truncateToolResultContent(blocks[j]["content"], maxChars); err == nil && did {
+					blocks[j]["content"] = newContent
+					blockChanged = true
+					changed++
+				}
+				if outRaw, ok := blocks[j]["output"]; ok {
+					if newOut, did, err := truncateToolResultContent(outRaw, maxChars); err == nil && did {
+						blocks[j]["output"] = newOut
+						blockChanged = true
+						changed++
+					}
+				}
+				continue
+			}
+			if btype != "text" && btype != "input_text" && btype != "output_text" && btype != "" {
 				continue
 			}
 			text := rawString(blocks[j]["text"])
-			if len(text) <= maxChars {
+			if text == "" {
+				// OpenAI content parts sometimes use "content" instead of "text".
+				text = rawString(blocks[j]["content"])
+				if text == "" || len(text) <= maxChars*2 {
+					continue
+				}
+				b, err := json.Marshal(TruncateToolResultText(text, maxChars*2))
+				if err != nil {
+					continue
+				}
+				blocks[j]["content"] = b
+				blockChanged = true
+				changed++
 				continue
 			}
-			b, err := json.Marshal(TruncateToolResultText(text, maxChars))
+			limit := maxChars * 2
+			if len(text) <= limit {
+				continue
+			}
+			b, err := json.Marshal(TruncateToolResultText(text, limit))
 			if err != nil {
 				continue
 			}
@@ -348,7 +501,124 @@ func truncateLargeTextBlocks(raw []byte, maxChars int) ([]byte, int, error) {
 	if err != nil {
 		return raw, 0, err
 	}
-	root["messages"] = mb
+	root[key] = mb
+	out, err := json.Marshal(root)
+	return out, changed, err
+}
+
+func truncateToolsInBody(raw []byte, maxChars int) ([]byte, int, error) {
+	if maxChars <= 0 {
+		return raw, 0, nil
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return raw, 0, err
+	}
+	toolsRaw, ok := root["tools"]
+	if !ok || len(toolsRaw) == 0 {
+		return raw, 0, nil
+	}
+	var tools []map[string]any
+	if err := json.Unmarshal(toolsRaw, &tools); err != nil {
+		return raw, 0, err
+	}
+	if len(tools) == 0 {
+		return raw, 0, nil
+	}
+	changed := 0
+	// Keep tool names; shrink descriptions and parameters dumps.
+	descLimit := maxChars / 4
+	if descLimit < 200 {
+		descLimit = 200
+	}
+	if descLimit > 4000 {
+		descLimit = 4000
+	}
+	for i := range tools {
+		if desc, ok := tools[i]["description"].(string); ok && len(desc) > descLimit {
+			tools[i]["description"] = TruncateToolResultText(desc, descLimit)
+			changed++
+		}
+		// OpenAI nested function object.
+		if fn, ok := tools[i]["function"].(map[string]any); ok {
+			if desc, ok := fn["description"].(string); ok && len(desc) > descLimit {
+				fn["description"] = TruncateToolResultText(desc, descLimit)
+				tools[i]["function"] = fn
+				changed++
+			}
+			// Drop huge parameter schema bodies when over budget by replacing with minimal object schema.
+			if params, ok := fn["parameters"]; ok {
+				pb, _ := json.Marshal(params)
+				if len(pb) > maxChars {
+					fn["parameters"] = map[string]any{"type": "object", "additionalProperties": true}
+					tools[i]["function"] = fn
+					changed++
+				}
+			}
+		}
+		if params, ok := tools[i]["parameters"]; ok {
+			pb, _ := json.Marshal(params)
+			if len(pb) > maxChars {
+				tools[i]["parameters"] = map[string]any{"type": "object", "additionalProperties": true}
+				changed++
+			}
+		}
+		if schema, ok := tools[i]["input_schema"]; ok {
+			pb, _ := json.Marshal(schema)
+			if len(pb) > maxChars {
+				tools[i]["input_schema"] = map[string]any{"type": "object", "additionalProperties": true}
+				changed++
+			}
+		}
+	}
+	// If still many tools, drop the oldest half of definitions (keep last N).
+	if len(tools) > 32 {
+		keep := len(tools) / 2
+		if keep < 16 {
+			keep = 16
+		}
+		if keep < len(tools) {
+			tools = tools[len(tools)-keep:]
+			changed++
+		}
+	}
+	if changed == 0 {
+		return raw, 0, nil
+	}
+	tb, err := json.Marshal(tools)
+	if err != nil {
+		return raw, 0, err
+	}
+	root["tools"] = tb
+	out, err := json.Marshal(root)
+	return out, changed, err
+}
+
+func truncateInstructionsInBody(raw []byte, maxChars int) ([]byte, int, error) {
+	if maxChars <= 0 {
+		return raw, 0, nil
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return raw, 0, err
+	}
+	changed := 0
+	// System/instructions often dominate Claude Code long sessions.
+	limit := maxChars
+	if limit < 4000 {
+		limit = 4000
+	}
+	for _, field := range []string{"system", "instructions"} {
+		if val, ok := root[field]; ok {
+			if ns, did, err := truncateAnyTextField(val, limit); err == nil && did {
+				root[field] = ns
+				changed++
+			}
+		}
+	}
+	if changed == 0 {
+		return raw, 0, nil
+	}
 	out, err := json.Marshal(root)
 	return out, changed, err
 }
@@ -370,7 +640,18 @@ func truncateAnyTextField(raw json.RawMessage, maxChars int) (json.RawMessage, b
 	changed := false
 	for i := range blocks {
 		text, _ := blocks[i]["text"].(string)
-		if text == "" || len(text) <= maxChars {
+		if text == "" {
+			if c, ok := blocks[i]["content"].(string); ok {
+				text = c
+				if text == "" || len(text) <= maxChars {
+					continue
+				}
+				blocks[i]["content"] = TruncateToolResultText(text, maxChars)
+				changed = true
+			}
+			continue
+		}
+		if len(text) <= maxChars {
 			continue
 		}
 		blocks[i]["text"] = TruncateToolResultText(text, maxChars)
@@ -408,6 +689,13 @@ func truncateToolResultContent(raw json.RawMessage, maxChars int) (json.RawMessa
 	for i := range blocks {
 		text, _ := blocks[i]["text"].(string)
 		if text == "" {
+			if c, ok := blocks[i]["content"].(string); ok && c != "" {
+				nt := TruncateToolResultText(c, maxChars)
+				if nt != c {
+					blocks[i]["content"] = nt
+					changed = true
+				}
+			}
 			continue
 		}
 		nt := TruncateToolResultText(text, maxChars)
@@ -428,29 +716,47 @@ func compactMessagesBody(raw []byte, keep int) ([]byte, int, string, error) {
 	if err := json.Unmarshal(raw, &root); err != nil {
 		return raw, 0, "", err
 	}
-	msgRaw, ok := root["messages"]
-	if !ok {
+	key := messageArrayKey(root)
+	if key == "" {
 		return raw, 0, "", nil
 	}
+	msgRaw := root[key]
 	var messages []json.RawMessage
 	if err := json.Unmarshal(msgRaw, &messages); err != nil {
 		return raw, 0, "", err
 	}
 	if keep <= 0 {
-		keep = 16
+		keep = 12
 	}
 	if len(messages) <= keep {
 		return raw, 0, "", nil
 	}
 	start := len(messages) - keep
+	// Prefer not to cut in the middle of a tool_use/tool_result pair when possible.
+	start = alignCompactStart(messages, start)
 	kept := append([]json.RawMessage(nil), messages[start:]...)
 	dropped := start
-	notice := map[string]any{
-		"role": "user",
-		"content": []map[string]any{{
-			"type": "text",
-			"text": fmt.Sprintf("[context auto-compacted by grokbuild-proxy: dropped %d older messages; recent turns preserved]", dropped),
-		}},
+	noticeText := fmt.Sprintf("[context auto-compacted by grokbuild-proxy: dropped %d older messages; recent turns preserved]", dropped)
+	var notice map[string]any
+	if key == "input" {
+		// Responses input item.
+		notice = map[string]any{
+			"type": "message",
+			"role": "user",
+			"content": []map[string]any{{
+				"type": "input_text",
+				"text": noticeText,
+			}},
+		}
+	} else {
+		// Anthropic / OpenAI chat message.
+		notice = map[string]any{
+			"role": "user",
+			"content": []map[string]any{{
+				"type": "text",
+				"text": noticeText,
+			}},
+		}
 	}
 	nb, err := json.Marshal(notice)
 	if err != nil {
@@ -463,12 +769,55 @@ func compactMessagesBody(raw []byte, keep int) ([]byte, int, string, error) {
 	if err != nil {
 		return raw, 0, "", err
 	}
-	root["messages"] = mb
+	root[key] = mb
 	out, err := json.Marshal(root)
 	if err != nil {
 		return raw, 0, "", err
 	}
 	return out, dropped, fmt.Sprintf("auto-compact dropped %d older messages", dropped), nil
+}
+
+func alignCompactStart(messages []json.RawMessage, start int) int {
+	if start <= 0 || start >= len(messages) {
+		return start
+	}
+	// If the first kept message is a tool result / tool role, walk back to include its parent assistant call.
+	for start > 0 && start < len(messages) {
+		var probe map[string]any
+		if json.Unmarshal(messages[start], &probe) != nil {
+			break
+		}
+		role, _ := probe["role"].(string)
+		typ, _ := probe["type"].(string)
+		if role == "tool" || role == "function" || typ == "function_call_output" || typ == "tool_result" {
+			start--
+			continue
+		}
+		// Anthropic user message that only contains tool_result blocks.
+		if role == "user" {
+			if content, ok := probe["content"].([]any); ok && len(content) > 0 {
+				onlyTool := true
+				for _, c := range content {
+					m, ok := c.(map[string]any)
+					if !ok {
+						onlyTool = false
+						break
+					}
+					t, _ := m["type"].(string)
+					if t != "tool_result" {
+						onlyTool = false
+						break
+					}
+				}
+				if onlyTool {
+					start--
+					continue
+				}
+			}
+		}
+		break
+	}
+	return start
 }
 
 // TruncateToolResultText trims oversized tool outputs while preserving head/tail.
@@ -527,6 +876,7 @@ func IsContextTooLongMessage(msg string) bool {
 		"exceeds the context",
 		"token limit",
 		"invalid-argument",
+		"request contains",
 	}
 	for _, n := range needles {
 		if strings.Contains(m, n) {

@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/GreyGunG/grokbuild-proxy/internal/anthropic"
 )
 
 // PostResponsesFunc is injected by the server/LB layer.
@@ -30,6 +32,9 @@ type Handlers struct {
 	Post PostResponsesFunc
 	// MaxBody limits request body size. Zero uses DefaultMaxBody.
 	MaxBody int64
+	// ContextGuard optionally auto-compacts oversized chat/responses bodies.
+	// When nil, no local context protection is applied.
+	ContextGuard *anthropic.ContextGuardConfig
 }
 
 func (h *Handlers) maxBody() int64 {

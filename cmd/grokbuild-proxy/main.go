@@ -215,9 +215,18 @@ func main() {
 	defer stopInspection()
 	go inspectionRunner.Run(inspectionCtx)
 
+	contextGuard := &anthropic.ContextGuardConfig{
+		MaxInputTokens:     cfg.Anthropic.EffectiveMaxInputTokens(),
+		SoftInputTokens:    cfg.Anthropic.EffectiveSoftInputTokens(),
+		MaxToolResultChars: cfg.Anthropic.EffectiveMaxToolResultChars(),
+		KeepRecentMessages: cfg.Anthropic.EffectiveKeepRecentMessages(),
+		PreserveCacheHints: cfg.Anthropic.PreserveCacheHintsEnabled(),
+		AutoCompact:        cfg.Anthropic.AutoCompactEnabled(),
+	}
 	oai := &openai.Handlers{
-		Post:    exec.Post,
-		MaxBody: cfg.Limits.MaxBodyBytes,
+		Post:         exec.Post,
+		MaxBody:      cfg.Limits.MaxBodyBytes,
+		ContextGuard: contextGuard,
 	}
 	anth := &anthropic.Handlers{
 		Post:    exec.Post,

@@ -37,7 +37,6 @@ type Config struct {
 	APIKey            string           `yaml:"api_key"`
 	AdminKey          string           `yaml:"admin_key"`
 	AllowPublicListen bool             `yaml:"allow_public_listen"`
-	AdminTrustedHosts []string         `yaml:"admin_trusted_hosts"`
 	Upstream          UpstreamConfig   `yaml:"upstream"`
 	OAuth             OAuthConfig      `yaml:"oauth"`
 	ChatBackend       string           `yaml:"chat_backend"`
@@ -77,7 +76,7 @@ type AnthropicConfig struct {
 	CountTokens         bool              `yaml:"count_tokens"`
 	// Context protection / auto-compact (Claude Code long-session support).
 	// SoftInputTokens triggers auto-compact; MaxInputTokens hard-rejects after compact.
-	// Defaults applied when zero: soft=400000, max=460000, tool_result=120000, keep=16.
+	// Defaults applied when zero: soft=320000, max=420000, tool_result=60000, keep=10.
 	AutoCompact        *bool `yaml:"auto_compact"`
 	SoftInputTokens    int   `yaml:"soft_input_tokens"`
 	MaxInputTokens     int   `yaml:"max_input_tokens"`
@@ -218,10 +217,10 @@ func Default() Config {
 			PassthroughPrefixes: []string{"grok-"},
 			StripUnknownBetas:   true,
 			CountTokens:         true,
-			SoftInputTokens:     400000,
-			MaxInputTokens:      460000,
-			MaxToolResultChars:  120000,
-			KeepRecentMessages:  16,
+			SoftInputTokens:     320000,
+			MaxInputTokens:      420000,
+			MaxToolResultChars:  60000,
+			KeepRecentMessages:  10,
 		},
 		LB: LBConfig{
 			Strategy:       "priority_rr",
@@ -462,11 +461,6 @@ func (c Config) Validate() error {
 	if c.Anthropic.MaxToolResultChars < 0 || c.Anthropic.KeepRecentMessages < 0 {
 		return fmt.Errorf("anthropic max_tool_result_chars/keep_recent_messages must be >= 0")
 	}
-	for _, host := range c.AdminTrustedHosts {
-		if _, err := NormalizeTrustedHost(host); err != nil {
-			return fmt.Errorf("admin_trusted_hosts: %w", err)
-		}
-	}
 	return c.ValidateListen(c.Listen)
 }
 
@@ -515,44 +509,6 @@ func IsPublicListen(addr string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip == nil || !ip.IsLoopback()
-}
-
-// NormalizeTrustedHost canonicalizes an HTTP Host allowlist entry. Ports are
-// accepted but deliberately ignored so one host remains trusted when the
-// listener is published through a different local/reverse-proxy port.
-func NormalizeTrustedHost(raw string) (string, error) {
-	value := strings.TrimSpace(raw)
-	if value == "" || strings.ContainsAny(value, "\r\n\x00") {
-		return "", fmt.Errorf("trusted host is empty or contains control characters")
-	}
-	if strings.Contains(value, "://") || strings.ContainsAny(value, "/\\@?#") {
-		return "", fmt.Errorf("trusted host %q must be a hostname or IP address, not a URL", raw)
-	}
-	if host, _, err := net.SplitHostPort(value); err == nil {
-		value = host
-	} else if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
-		value = strings.TrimSuffix(strings.TrimPrefix(value, "["), "]")
-	} else if strings.Contains(value, ":") && net.ParseIP(value) == nil {
-		return "", fmt.Errorf("trusted host %q has an invalid port or IPv6 form", raw)
-	}
-	value = strings.ToLower(strings.TrimSuffix(strings.Trim(value, "[]"), "."))
-	if value == "" || value == "0.0.0.0" || value == "::" || strings.Contains(value, "*") {
-		return "", fmt.Errorf("trusted host %q must be an exact non-wildcard host", raw)
-	}
-	if ip := net.ParseIP(value); ip != nil {
-		return ip.String(), nil
-	}
-	for _, label := range strings.Split(value, ".") {
-		if label == "" || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
-			return "", fmt.Errorf("trusted host %q is invalid", raw)
-		}
-		for _, char := range label {
-			if (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '-' {
-				return "", fmt.Errorf("trusted host %q is invalid", raw)
-			}
-		}
-	}
-	return value, nil
 }
 
 // StickyTTL returns sticky session TTL as a duration.
@@ -689,7 +645,7 @@ func (c AnthropicConfig) EffectiveSoftInputTokens() int {
 	if c.MaxInputTokens > 0 {
 		return c.MaxInputTokens * 9 / 10
 	}
-	return 400000
+	return 320000
 }
 
 // EffectiveMaxInputTokens returns hard reject threshold with defaults.
@@ -697,7 +653,7 @@ func (c AnthropicConfig) EffectiveMaxInputTokens() int {
 	if c.MaxInputTokens > 0 {
 		return c.MaxInputTokens
 	}
-	return 460000
+	return 420000
 }
 
 // EffectiveMaxToolResultChars returns tool_result truncation budget.
@@ -705,7 +661,7 @@ func (c AnthropicConfig) EffectiveMaxToolResultChars() int {
 	if c.MaxToolResultChars > 0 {
 		return c.MaxToolResultChars
 	}
-	return 120000
+	return 60000
 }
 
 // EffectiveKeepRecentMessages returns how many recent messages survive compact.
@@ -713,5 +669,5 @@ func (c AnthropicConfig) EffectiveKeepRecentMessages() int {
 	if c.KeepRecentMessages > 0 {
 		return c.KeepRecentMessages
 	}
-	return 16
+	return 10
 }
