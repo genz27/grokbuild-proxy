@@ -62,10 +62,10 @@ anthropic:
   # Soft threshold triggers compact; hard max rejects after compact fails.
   # Keep under upstream 500k prompt limit with headroom for tools/system.
   auto_compact: true
-  soft_input_tokens: 320000
-  max_input_tokens: 420000
-  max_tool_result_chars: 60000
-  keep_recent_messages: 10
+  soft_input_tokens: 400000
+  max_input_tokens: 460000
+  max_tool_result_chars: 120000
+  keep_recent_messages: 16
   preserve_cache_hints: true
 lb:
   strategy: "priority_rr"

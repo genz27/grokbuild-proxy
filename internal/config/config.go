@@ -76,7 +76,8 @@ type AnthropicConfig struct {
 	CountTokens         bool              `yaml:"count_tokens"`
 	// Context protection / auto-compact (Claude Code long-session support).
 	// SoftInputTokens triggers auto-compact; MaxInputTokens hard-rejects after compact.
-	// Defaults applied when zero: soft=320000, max=420000, tool_result=60000, keep=10.
+	// Defaults applied when zero: soft=400000, max=460000, tool_result=120000, keep=16.
+	// Keep these high enough that normal Claude Code sessions are not history-stripped.
 	AutoCompact        *bool `yaml:"auto_compact"`
 	SoftInputTokens    int   `yaml:"soft_input_tokens"`
 	MaxInputTokens     int   `yaml:"max_input_tokens"`
@@ -237,10 +238,10 @@ func Default() Config {
 			PassthroughPrefixes: []string{"grok-"},
 			StripUnknownBetas:   true,
 			CountTokens:         true,
-			SoftInputTokens:     320000,
-			MaxInputTokens:      420000,
-			MaxToolResultChars:  60000,
-			KeepRecentMessages:  10,
+			SoftInputTokens:     400000,
+			MaxInputTokens:      460000,
+			MaxToolResultChars:  120000,
+			KeepRecentMessages:  16,
 		},
 		LB: LBConfig{
 			Strategy:       "priority_rr",
@@ -665,7 +666,7 @@ func (c AnthropicConfig) EffectiveSoftInputTokens() int {
 	if c.MaxInputTokens > 0 {
 		return c.MaxInputTokens * 9 / 10
 	}
-	return 320000
+	return 400000
 }
 
 // EffectiveMaxInputTokens returns hard reject threshold with defaults.
@@ -673,7 +674,7 @@ func (c AnthropicConfig) EffectiveMaxInputTokens() int {
 	if c.MaxInputTokens > 0 {
 		return c.MaxInputTokens
 	}
-	return 420000
+	return 460000
 }
 
 // EffectiveMaxToolResultChars returns tool_result truncation budget.
@@ -681,7 +682,7 @@ func (c AnthropicConfig) EffectiveMaxToolResultChars() int {
 	if c.MaxToolResultChars > 0 {
 		return c.MaxToolResultChars
 	}
-	return 60000
+	return 120000
 }
 
 // EffectiveKeepRecentMessages returns how many recent messages survive compact.
@@ -689,5 +690,5 @@ func (c AnthropicConfig) EffectiveKeepRecentMessages() int {
 	if c.KeepRecentMessages > 0 {
 		return c.KeepRecentMessages
 	}
-	return 10
+	return 16
 }

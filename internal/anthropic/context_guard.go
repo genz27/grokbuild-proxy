@@ -116,9 +116,9 @@ func EstimateRawTokens(raw []byte) int {
 	} else {
 		tokens = estimateStringTokens(string(raw))
 	}
-	// Conservative floor for code/log-heavy payloads.
-	// Upstream counts closer to ~1 token / 3-4 bytes for mixed JSON+code.
-	byteFloor := (len(raw) + 2) / 3
+	// Soft floor only — too aggressive floors (e.g. bytes/3) make normal Claude Code
+	// sessions look "over budget" and trigger history-dropping auto-compact loops.
+	byteFloor := (len(raw) + 3) / 4
 	if byteFloor > tokens {
 		tokens = byteFloor
 	}
@@ -152,9 +152,11 @@ func prepareBody(raw []byte, cfg ContextGuardConfig, shape bodyShape) (out []byt
 	out = append([]byte(nil), raw...)
 
 	// Leave headroom under the common 500k upstream hard limit.
+	// Prefer preserving Claude Code history over aggressive compact — dropping
+	// mid-task tool turns causes the agent to re-read the same files in a loop.
 	safetyTarget := cfg.SoftInputTokens
-	if safetyTarget <= 0 || safetyTarget > 450000 {
-		safetyTarget = 450000
+	if safetyTarget <= 0 || safetyTarget > 470000 {
+		safetyTarget = 470000
 	}
 	if cfg.MaxInputTokens > 0 && cfg.MaxInputTokens < safetyTarget {
 		safetyTarget = cfg.MaxInputTokens
@@ -162,7 +164,7 @@ func prepareBody(raw []byte, cfg ContextGuardConfig, shape bodyShape) (out []byt
 
 	toolBudget := cfg.MaxToolResultChars
 	if toolBudget <= 0 {
-		toolBudget = 80000
+		toolBudget = 120000
 	}
 
 	// Always truncate oversized tool results first (cheap and high impact).
@@ -175,9 +177,9 @@ func prepareBody(raw []byte, cfg ContextGuardConfig, shape bodyShape) (out []byt
 	if cfg.AutoCompact {
 		keep := cfg.KeepRecentMessages
 		if keep <= 0 {
-			keep = 12
+			keep = 16
 		}
-		for attempt := 0; attempt < 16 && EstimateRawTokens(out) > safetyTarget; attempt++ {
+		for attempt := 0; attempt < 12 && EstimateRawTokens(out) > safetyTarget; attempt++ {
 			rewritten, dropped, note, cerr := compactMessagesBody(out, keep)
 			if cerr == nil && (dropped > 0 || len(rewritten) != len(out)) {
 				out = rewritten
@@ -186,10 +188,10 @@ func prepareBody(raw []byte, cfg ContextGuardConfig, shape bodyShape) (out []byt
 				result.Applied = true
 			}
 
-			if toolBudget > 2000 {
+			if toolBudget > 3000 {
 				toolBudget = toolBudget * 2 / 3
-				if toolBudget < 2000 {
-					toolBudget = 2000
+				if toolBudget < 3000 {
+					toolBudget = 3000
 				}
 			}
 			if rewritten, n, terr := truncateToolResultsInBody(out, toolBudget); terr == nil && n > 0 {
@@ -201,34 +203,15 @@ func prepareBody(raw []byte, cfg ContextGuardConfig, shape bodyShape) (out []byt
 				out = rewritten
 				result.Applied = true
 			}
-			// Shrink tool definitions / instructions when message history alone is not enough.
-			if rewritten, n, terr := truncateToolsInBody(out, toolBudget); terr == nil && n > 0 {
-				out = rewritten
-				result.Applied = true
-			}
-			if rewritten, n, terr := truncateInstructionsInBody(out, toolBudget); terr == nil && n > 0 {
-				out = rewritten
-				result.Applied = true
-			}
 
+			// Do not shrink tool schemas / system prompts / keep=1 here.
+			// Those destroy Claude Code agent state and trigger tool-read loops.
 			if keep > 2 {
 				next := keep * 2 / 3
 				if next < 2 {
 					next = 2
 				}
 				keep = next
-			} else if keep > 1 {
-				keep = 1
-			}
-
-			// Last-resort: drop all but the newest message + a compact notice.
-			if attempt >= 10 && EstimateRawTokens(out) > safetyTarget {
-				if rewritten, dropped, note, cerr := compactMessagesBody(out, 1); cerr == nil && dropped > 0 {
-					out = rewritten
-					result.DroppedMessages += dropped
-					result.Note = note
-					result.Applied = true
-				}
 			}
 			_ = shape
 		}
@@ -726,7 +709,7 @@ func compactMessagesBody(raw []byte, keep int) ([]byte, int, string, error) {
 		return raw, 0, "", err
 	}
 	if keep <= 0 {
-		keep = 12
+		keep = 16
 	}
 	if len(messages) <= keep {
 		return raw, 0, "", nil
