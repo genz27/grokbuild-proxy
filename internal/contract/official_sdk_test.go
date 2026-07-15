@@ -315,8 +315,15 @@ func TestOfficialSDKContracts(t *testing.T) {
 			t.Fatalf("missing CPA thinking block: %s", firstJSON)
 		}
 
+		toolUseID := "call_cpa"
+		for _, block := range first.Content {
+			if block.Type == "tool_use" && block.ID != "" {
+				toolUseID = block.ID
+				break
+			}
+		}
 		toolResult := anthropicsdk.NewUserMessage(
-			anthropicsdk.NewToolResultBlock("call_cpa", "inspection result", false),
+			anthropicsdk.NewToolResultBlock(toolUseID, "inspection result", false),
 		)
 		second, err := client.Messages.New(context.Background(), anthropicsdk.MessageNewParams{
 			Model:        "claude-opus-4-6",
@@ -350,11 +357,11 @@ func TestOfficialSDKContracts(t *testing.T) {
 					replayIndex = i
 				}
 			case "function_call":
-				if item["call_id"] == "call_cpa" {
+				if item["call_id"] == toolUseID {
 					callIndex = i
 				}
 			case "function_call_output":
-				if item["call_id"] == "call_cpa" {
+				if item["call_id"] == toolUseID {
 					outputIndex = i
 				}
 			}
