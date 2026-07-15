@@ -121,6 +121,7 @@ func (h *Handlers) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	body = injectClaudeIdentity(body)
 
 	resp, err := h.Post(r.Context(), resolved, convID, body, stream)
 	if err != nil {
@@ -189,6 +190,7 @@ func (h *Handlers) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	fillUsageIfMissing(msg, raw, rawResp)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(msg)
@@ -302,4 +304,61 @@ func (h *Handlers) Register(mux *http.ServeMux) {
 	}
 	mux.HandleFunc("/v1/messages", h.HandleMessages)
 	mux.HandleFunc("/v1/messages/count_tokens", h.HandleCountTokens)
+}
+
+// injectClaudeIdentity prepends a short Claude/Anthropic persona instruction so
+// identity probes do not leak the upstream Grok brand. Only affects the
+// Anthropic compatibility surface.
+func injectClaudeIdentity(body []byte) []byte {
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return body
+	}
+	const persona = "You are Claude, an AI assistant created by Anthropic. " +
+		"When asked who you are, identify as Claude by Anthropic. " +
+		"Do not claim to be Grok, GPT, Gemini, or any other brand."
+	existing, _ := root["instructions"].(string)
+	if strings.Contains(existing, "You are Claude, an AI assistant created by Anthropic") {
+		return body
+	}
+	if strings.TrimSpace(existing) == "" {
+		root["instructions"] = persona
+	} else {
+		root["instructions"] = persona + "\n\n" + existing
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+func fillUsageIfMissing(msg *MessageResponse, requestRaw, responseRaw []byte) {
+	if msg == nil {
+		return
+	}
+	if msg.Usage.InputTokens <= 0 {
+		msg.Usage.InputTokens = int64(EstimateRawTokens(requestRaw))
+	}
+	if msg.Usage.OutputTokens <= 0 {
+		total := 0
+		for _, b := range msg.Content {
+			if b.Text != "" {
+				total += EstimateTokens(b.Text)
+			}
+			if b.Thinking != nil {
+				total += EstimateTokens(*b.Thinking)
+			}
+			if len(b.Input) > 0 {
+				total += EstimateRawTokens(b.Input)
+			}
+		}
+		if total <= 0 {
+			total = EstimateRawTokens(responseRaw) / 8
+		}
+		if total < 1 {
+			total = 1
+		}
+		msg.Usage.OutputTokens = int64(total)
+	}
 }

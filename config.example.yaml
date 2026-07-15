@@ -20,17 +20,40 @@ anthropic:
   model_aliases:
     claude-sonnet-4: grok-4.5
     claude-sonnet-4-0: grok-4.5
+    claude-sonnet-4-20250514: grok-4.5
+    claude-sonnet-4-5: grok-4.5
+    claude-sonnet-4-5-20250929: grok-4.5
     claude-sonnet-4-6: grok-4.5
     claude-sonnet-5: grok-4.5
+    claude-3-5-sonnet-latest: grok-4.5
+    claude-3-5-sonnet-20241022: grok-4.5
+    claude-3-5-sonnet-20240620: grok-4.5
+    claude-3-7-sonnet-latest: grok-4.5
+    claude-3-7-sonnet-20250219: grok-4.5
+    claude-3-sonnet-20240229: grok-4.5
     claude-opus-4: grok-4.5
+    claude-opus-4-0: grok-4.5
+    claude-opus-4-1: grok-4.5
+    claude-opus-4-1-20250805: grok-4.5
+    claude-opus-4-5: grok-4.5
+    claude-opus-4-5-20251101: grok-4.5
     claude-opus-4-6: grok-4.5
     claude-opus-4-7: grok-4.5
     claude-opus-4-8: grok-4.5
+    claude-opus-4-20250514: grok-4.5
+    claude-3-opus-latest: grok-4.5
+    claude-3-opus-20240229: grok-4.5
     claude-haiku-4: grok-4.5
     claude-haiku-4-5: grok-4.5
+    claude-haiku-4-5-20251001: grok-4.5
+    claude-3-5-haiku-latest: grok-4.5
+    claude-3-5-haiku-20241022: grok-4.5
+    claude-3-haiku-20240307: grok-4.5
     sonnet: grok-4.5
     opus: grok-4.5
     haiku: grok-4.5
+    claude-fable-5: grok-4.5
+    fable-5: grok-4.5
   passthrough_prefixes: ["grok-"]
   # Unknown beta extensions are dropped; recognized thinking/effort is mapped.
   strip_unknown_betas: true

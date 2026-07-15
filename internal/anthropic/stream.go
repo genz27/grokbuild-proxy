@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // StreamState tracks Claude SSE emission while reading Responses SSE.
@@ -118,12 +117,7 @@ func (t *StreamTranslator) EnsureStart(id, model string) error {
 	if t.State.Started {
 		return nil
 	}
-	if id == "" {
-		id = fmt.Sprintf("msg_%d", time.Now().UnixNano())
-	}
-	if strings.HasPrefix(id, "resp_") {
-		id = "msg_" + strings.TrimPrefix(id, "resp_")
-	}
+	id = normalizeMessageID(id)
 	if model == "" {
 		model = t.State.RequestModel
 	}
@@ -188,6 +182,7 @@ func (t *StreamTranslator) ensureToolBlock(key, callID, name string) (*streamBlo
 	if callID == "" {
 		callID = strings.TrimPrefix(key, "tool:")
 	}
+	callID = normalizeToolUseID(callID)
 	if name == "" {
 		name = "tool"
 	}

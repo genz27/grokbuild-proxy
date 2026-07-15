@@ -244,8 +244,8 @@ func TestTranslateResponse_FunctionCallToToolUse(t *testing.T) {
 	if tu.Type != "tool_use" {
 		t.Fatalf("type=%q", tu.Type)
 	}
-	if tu.ID != "call_xyz" {
-		t.Fatalf("id=%q", tu.ID)
+	if !strings.HasPrefix(tu.ID, "toolu_") {
+		t.Fatalf("id=%q want toolu_ prefix", tu.ID)
 	}
 	if tu.Name != "get_time" {
 		t.Fatalf("name=%q", tu.Name)

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 )
 
 // MessageResponse is the Anthropic non-stream message response.
@@ -71,13 +70,7 @@ func TranslateResponse(raw []byte, opts TranslateRespOptions) (*MessageResponse,
 		}
 	}
 
-	id := rawString(root["id"])
-	if id == "" {
-		id = "msg_" + fmt.Sprintf("%d", time.Now().UnixNano())
-	}
-	if strings.HasPrefix(id, "resp_") {
-		id = "msg_" + strings.TrimPrefix(id, "resp_")
-	}
+	id := normalizeMessageID(rawString(root["id"]))
 
 	model := opts.RequestModel
 	if model == "" {
@@ -115,10 +108,7 @@ func TranslateResponse(raw []byte, opts TranslateRespOptions) (*MessageResponse,
 					}
 				case "function_call":
 					hasTool = true
-					callID := rawString(item["call_id"])
-					if callID == "" {
-						callID = rawString(item["id"])
-					}
+					callID := normalizeToolUseID(firstNonEmpty(rawString(item["call_id"]), rawString(item["id"])))
 					name := rawString(item["name"])
 					args := "{}"
 					if a, ok := item["arguments"]; ok && len(a) > 0 {
@@ -304,4 +294,13 @@ func normalizeStopReason(s string, hasTool bool) string {
 	default:
 		return "end_turn"
 	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
