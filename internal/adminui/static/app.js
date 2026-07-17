@@ -11,7 +11,7 @@
     settings: null,
     busy: false,
     credentialsPage: 1,
-    credentialsPageSize: 50,
+    credentialsPageSize: 20,
   };
 
   // ---------- DOM helpers (no innerHTML for untrusted data) ----------
@@ -360,7 +360,7 @@
       size.appendChild(option);
     });
     size.addEventListener("change", function () {
-      state.credentialsPageSize = Number(size.value) || 50;
+      state.credentialsPageSize = Number(size.value) || 20;
       state.credentialsPage = 1;
       loadCredentials();
     });
