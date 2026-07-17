@@ -25,8 +25,10 @@ type Prefetcher struct {
 	Concurrency int
 	Logger      *slog.Logger
 
-	stop chan struct{}
-	once sync.Once
+	stop     chan struct{}
+	once     sync.Once
+	cursorMu sync.Mutex
+	cursor   int
 }
 
 // Start launches the background loop. Safe to call once.
@@ -94,7 +96,17 @@ func (p *Prefetcher) tick() {
 	}
 
 	candidates := make([]storage.Credential, 0, maxN)
-	for _, c := range creds {
+	p.cursorMu.Lock()
+	start := p.cursor
+	if start < 0 || start >= len(creds) {
+		start = 0
+	}
+	p.cursorMu.Unlock()
+	last := start
+	for scanned := 0; scanned < len(creds); scanned++ {
+		index := (start + scanned) % len(creds)
+		c := creds[index]
+		last = index
 		if !c.Enabled {
 			continue
 		}
@@ -111,6 +123,11 @@ func (p *Prefetcher) tick() {
 		if len(candidates) >= maxN {
 			break
 		}
+	}
+	if len(creds) > 0 {
+		p.cursorMu.Lock()
+		p.cursor = (last + 1) % len(creds)
+		p.cursorMu.Unlock()
 	}
 	if len(candidates) == 0 {
 		return
