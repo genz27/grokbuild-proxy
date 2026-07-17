@@ -10,6 +10,8 @@
     system: null,
     settings: null,
     busy: false,
+    credentialsPage: 1,
+    credentialsPageSize: 50,
   };
 
   // ---------- DOM helpers (no innerHTML for untrusted data) ----------
@@ -284,23 +286,86 @@
   function loadCredentials() {
     var list = $("cred-list");
     var empty = $("cred-empty");
+    var pagination = $("cred-pagination");
     if (!list) return;
     clear(list);
     show(empty, false);
-    api("GET", "/admin/credentials")
+    show(pagination, false);
+    api(
+      "GET",
+      "/admin/credentials?page=" + encodeURIComponent(state.credentialsPage) +
+        "&page_size=" + encodeURIComponent(state.credentialsPageSize)
+    )
       .then(function (data) {
         var creds = (data && data.credentials) || [];
+        state.credentialsPage = Number(data && data.page) || state.credentialsPage;
         if (!creds.length) {
           show(empty, true);
+          renderCredentialPagination(data);
           return;
         }
+        // Build the complete list off-DOM to avoid one layout/repaint per card.
+        var fragment = document.createDocumentFragment();
         creds.forEach(function (c) {
-          list.appendChild(renderCredentialCard(c));
+          fragment.appendChild(renderCredentialCard(c));
         });
+        list.appendChild(fragment);
+        renderCredentialPagination(data);
       })
       .catch(function (err) {
         toast("加载凭证失败: " + err.message, "err");
       });
+  }
+
+  function renderCredentialPagination(data) {
+    var host = $("cred-pagination");
+    if (!host) return;
+    clear(host);
+    var total = Number(data && data.total) || 0;
+    var totalPages = Number(data && data.total_pages) || 0;
+    if (totalPages <= 1) {
+      show(host, false);
+      return;
+    }
+    var page = Number(data && data.page) || state.credentialsPage;
+    var prev = el("button", "btn btn-sm", "上一页");
+    prev.type = "button";
+    prev.disabled = page <= 1;
+    prev.addEventListener("click", function () {
+      if (state.credentialsPage > 1) {
+        state.credentialsPage--;
+        loadCredentials();
+      }
+    });
+    host.appendChild(prev);
+    var label = el("span", "muted", "第 " + page + " / " + totalPages + " 页 · 共 " + total + " 个账号");
+    host.appendChild(label);
+    var next = el("button", "btn btn-sm", "下一页");
+    next.type = "button";
+    next.disabled = page >= totalPages;
+    next.addEventListener("click", function () {
+      if (state.credentialsPage < totalPages) {
+        state.credentialsPage++;
+        loadCredentials();
+      }
+    });
+    host.appendChild(next);
+    var size = document.createElement("select");
+    size.className = "page-size";
+    size.setAttribute("aria-label", "每页账号数");
+    [20, 50, 100, 200].forEach(function (value) {
+      var option = el("option", "", String(value) + " / 页");
+      option.value = String(value);
+      option.selected = value === state.credentialsPageSize;
+      size.appendChild(option);
+    });
+    size.addEventListener("change", function () {
+      state.credentialsPageSize = Number(size.value) || 50;
+      state.credentialsPage = 1;
+      loadCredentials();
+    });
+    host.appendChild(size);
+    show(host, true);
   }
 
   function renderCredentialCard(c) {
@@ -369,11 +434,9 @@
       meta.appendChild(lineMeta("访问令牌(脱敏)", c.access_token));
     }
     var usageBox = el("div", "usage-box");
-    usageBox.appendChild(el("div", "muted", "额度加载中…"));
+    usageBox.appendChild(el("div", "muted", "点击“账单”查看额度"));
     meta.appendChild(usageBox);
     card.appendChild(meta);
-    // Async fill usage summary on each card (no raw JSON).
-    fillCredentialUsage(usageBox, c.id);
 
     var prioRow = el("div", "priority-row");
     prioRow.appendChild(el("span", "label", "优先级"));
@@ -596,29 +659,6 @@
     }
     reloadBtn.addEventListener("click", load);
     load();
-  }
-
-  function fillCredentialUsage(box, credId) {
-    if (!box || !credId) return;
-    api("GET", "/admin/credentials/" + encodeURIComponent(credId) + "/billing")
-      .then(function (snap) {
-        clear(box);
-        var build = (snap && snap.grok_build) || {};
-        if (!build.reported || build.shared_weekly_usage_percent == null) {
-          box.appendChild(usageBar("Grok Build", 0, "未报告", "neutral"));
-          return;
-        }
-        var pct = num(build.shared_weekly_usage_percent);
-        var label = "共享周额度已用 " + pct.toFixed(1) + "%";
-        if (build.grok_build_contribution_percent != null) {
-          label += " · Build 贡献 " + num(build.grok_build_contribution_percent).toFixed(1) + "%";
-        }
-        box.appendChild(usageBar("Grok Build", pct, label, toneFromPct(pct)));
-      })
-      .catch(function (err) {
-        clear(box);
-        box.appendChild(el("div", "error", "额度: " + (err.message || "失败")));
-      });
   }
 
   function parseUsage(snap) {
