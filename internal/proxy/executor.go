@@ -92,9 +92,19 @@ type Executor struct {
 	// refreshed access token through a transport resolved under old settings.
 	RouteRevision func() uint64
 
-	usageMu  sync.Mutex
-	lastUsed map[string]time.Time
-	path     pathCounters
+	usageMu   sync.Mutex
+	lastUsed  map[string]time.Time
+	billingMu sync.Mutex
+	billing   map[string]billingCacheEntry
+	path      pathCounters
+}
+
+const billingCacheTTL = 30 * time.Second
+
+type billingCacheEntry struct {
+	fingerprint string
+	fetchedAt   time.Time
+	snapshot    *upstream.BillingSnapshot
 }
 
 // Post implements openai.PostResponsesFunc / anthropic.PostResponsesFunc.
@@ -561,6 +571,16 @@ func (e *Executor) GetBillingSnapshot(ctx context.Context, credID string) (*upst
 	if err != nil {
 		return nil, err
 	}
+	fingerprint := tokenFingerprint(credential)
+	now := e.now()
+	e.billingMu.Lock()
+	if entry, ok := e.billing[credID]; ok && entry.snapshot != nil &&
+		entry.fingerprint == fingerprint && now.Sub(entry.fetchedAt) < billingCacheTTL {
+		snapshot := cloneBillingSnapshot(entry.snapshot)
+		e.billingMu.Unlock()
+		return snapshot, nil
+	}
+	e.billingMu.Unlock()
 	tokens, durable, err := e.ensureDurableCredential(ctx, credential, false)
 	if err != nil {
 		return nil, err
@@ -569,7 +589,31 @@ func (e *Executor) GetBillingSnapshot(ctx context.Context, credID string) (*upst
 	if err != nil {
 		return nil, err
 	}
-	return client.GetBillingSnapshot(ctx, verified.AccessToken)
+	snapshot, err := client.GetBillingSnapshot(ctx, verified.AccessToken)
+	if err != nil {
+		return nil, err
+	}
+	e.billingMu.Lock()
+	if e.billing == nil {
+		e.billing = make(map[string]billingCacheEntry)
+	}
+	e.billing[credID] = billingCacheEntry{
+		fingerprint: tokenFingerprint(durable), fetchedAt: e.now(), snapshot: cloneBillingSnapshot(snapshot),
+	}
+	e.billingMu.Unlock()
+	return snapshot, nil
+}
+
+func tokenFingerprint(credential storage.Credential) string {
+	return credential.AccessToken + "\x00" + credential.RefreshToken
+}
+
+func cloneBillingSnapshot(snapshot *upstream.BillingSnapshot) *upstream.BillingSnapshot {
+	if snapshot == nil {
+		return nil
+	}
+	clone := *snapshot
+	return &clone
 }
 
 // ProbeCredential validates one credential without selecting or failing over to
