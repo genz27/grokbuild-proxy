@@ -171,3 +171,39 @@ func TestPrepareOpenAIBodyCompactsResponsesInput(t *testing.T) {
 		t.Fatalf("unexpected input count %d", len(arr))
 	}
 }
+
+func TestEmergencyCompactShrinksToolSchemasAndSystemPrompt(t *testing.T) {
+	tools := make([]map[string]any, 0, 40)
+	for i := 0; i < 40; i++ {
+		tools = append(tools, map[string]any{
+			"name":        fmt.Sprintf("tool_%d", i),
+			"description": strings.Repeat("description ", 1000),
+			"input_schema": map[string]any{
+				"type":        "object",
+				"description": strings.Repeat("schema ", 2000),
+			},
+		})
+	}
+	body, _ := json.Marshal(map[string]any{
+		"model":  "grok-4.5",
+		"system": strings.Repeat("system instructions ", 10000),
+		"tools":  tools,
+		"messages": []map[string]any{{
+			"role": "user", "content": "hello",
+		}},
+	})
+	cfg := ContextGuardConfig{
+		AutoCompact: true, SoftInputTokens: 10000, MaxInputTokens: 12000,
+		MaxToolResultChars: 3000, KeepRecentMessages: 2,
+	}
+	out, result, err := PrepareAnthropicBody(body, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Applied || result.EstimatedAfter > cfg.MaxInputTokens {
+		t.Fatalf("emergency compact failed: %+v", result)
+	}
+	if len(out) >= len(body) {
+		t.Fatalf("expected smaller body: before=%d after=%d", len(body), len(out))
+	}
+}

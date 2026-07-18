@@ -223,15 +223,65 @@ func prepareBody(raw []byte, cfg ContextGuardConfig, shape bodyShape) (out []byt
 		}
 	}
 
+	// Emergency pass: recent messages, tool schemas, or the system prompt can
+	// individually exceed the hard limit even after normal compaction. Prefer a
+	// degraded but usable request over an otherwise guaranteed 400 response.
+	if cfg.AutoCompact && cfg.MaxInputTokens > 0 && EstimateRawTokens(out) > cfg.MaxInputTokens {
+		for attempt := 0; attempt < 3 && EstimateRawTokens(out) > cfg.MaxInputTokens; attempt++ {
+			if rewritten, n, terr := truncateToolsInBody(out, 6000); terr == nil && n > 0 {
+				out = rewritten
+				result.Applied = true
+			}
+		}
+		if EstimateRawTokens(out) > cfg.MaxInputTokens {
+			if rewritten, n, terr := truncateInstructionsInBody(out, 24000); terr == nil && n > 0 {
+				out = rewritten
+				result.Applied = true
+			}
+		}
+		if EstimateRawTokens(out) > cfg.MaxInputTokens {
+			if rewritten, dropped, note, cerr := compactMessagesBody(out, 1); cerr == nil && dropped > 0 {
+				out = rewritten
+				result.DroppedMessages += dropped
+				result.Note = note
+				result.Applied = true
+			}
+		}
+		if EstimateRawTokens(out) > cfg.MaxInputTokens {
+			if rewritten, n, terr := truncateLargeTextBlocks(out, 3000); terr == nil && n > 0 {
+				out = rewritten
+				result.Applied = true
+			}
+		}
+	}
+
 	after := EstimateRawTokens(out)
 	result.EstimatedAfter = after
 	if cfg.MaxInputTokens > 0 && after > cfg.MaxInputTokens {
+		breakdown := contextSizeBreakdown(out)
 		return out, result, fmt.Errorf(
-			"context_too_long: estimated input_tokens=%d exceeds max_input_tokens=%d after auto-compact; start a new session or remove large tool outputs",
-			after, cfg.MaxInputTokens,
+			"context_too_long: estimated input_tokens=%d exceeds max_input_tokens=%d after auto-compact (%s); start a new session or remove the largest component",
+			after, cfg.MaxInputTokens, breakdown,
 		)
 	}
 	return out, result, nil
+}
+
+func contextSizeBreakdown(raw []byte) string {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return fmt.Sprintf("request_bytes=%d", len(raw))
+	}
+	parts := make([]string, 0, 4)
+	for _, key := range []string{"system", "instructions", "tools", "messages", "input"} {
+		if value, ok := root[key]; ok {
+			parts = append(parts, fmt.Sprintf("%s_bytes=%d", key, len(value)))
+		}
+	}
+	if len(parts) == 0 {
+		return fmt.Sprintf("request_bytes=%d", len(raw))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func messageArrayKey(root map[string]json.RawMessage) string {
