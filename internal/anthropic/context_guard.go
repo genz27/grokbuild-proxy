@@ -161,6 +161,15 @@ func prepareBody(raw []byte, cfg ContextGuardConfig, shape bodyShape) (out []byt
 	if cfg.MaxInputTokens > 0 && cfg.MaxInputTokens < safetyTarget {
 		safetyTarget = cfg.MaxInputTokens
 	}
+	// Local estimation is intentionally lightweight and can undercount the
+	// upstream tokenizer, especially after Anthropic-to-Responses translation.
+	// Keep 20% headroom so an estimated-safe request does not fail upstream.
+	if cfg.MaxInputTokens > 0 {
+		headroomTarget := cfg.MaxInputTokens * 4 / 5
+		if headroomTarget > 0 && headroomTarget < safetyTarget {
+			safetyTarget = headroomTarget
+		}
+	}
 
 	toolBudget := cfg.MaxToolResultChars
 	if toolBudget <= 0 {

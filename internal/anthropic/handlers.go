@@ -122,6 +122,25 @@ func (h *Handlers) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body = injectClaudeIdentity(body)
+	// Translation and identity injection can expand the request substantially.
+	// Guard the exact upstream payload as well as the original Anthropic body.
+	preparedBody, translatedCompact, translatedErr := PrepareOpenAIBody(body, guardCfg)
+	if translatedErr != nil {
+		WriteError(w, http.StatusBadRequest, translatedErr.Error())
+		return
+	}
+	if translatedCompact.Applied {
+		body = preparedBody
+		w.Header().Set("X-Grokbuild-Context-Compact", "1")
+		if translatedCompact.DroppedMessages > 0 {
+			w.Header().Set("X-Grokbuild-Dropped-Messages", fmt.Sprintf("%d", translatedCompact.DroppedMessages))
+		}
+		if translatedCompact.TruncatedToolResults > 0 {
+			w.Header().Set("X-Grokbuild-Truncated-Tool-Results", fmt.Sprintf("%d", translatedCompact.TruncatedToolResults))
+		}
+		w.Header().Set("X-Grokbuild-Upstream-Input-Tokens-Before", fmt.Sprintf("%d", translatedCompact.EstimatedBefore))
+		w.Header().Set("X-Grokbuild-Upstream-Input-Tokens-After", fmt.Sprintf("%d", translatedCompact.EstimatedAfter))
+	}
 
 	resp, err := h.Post(r.Context(), resolved, convID, body, stream)
 	if err != nil {

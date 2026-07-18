@@ -207,3 +207,27 @@ func TestEmergencyCompactShrinksToolSchemasAndSystemPrompt(t *testing.T) {
 		t.Fatalf("expected smaller body: before=%d after=%d", len(body), len(out))
 	}
 }
+
+func TestAutoCompactKeepsTokenizerSafetyHeadroom(t *testing.T) {
+	messages := make([]map[string]any, 0, 40)
+	for i := 0; i < 40; i++ {
+		messages = append(messages, map[string]any{
+			"role": "user", "content": strings.Repeat("headroom ", 1000),
+		})
+	}
+	body, _ := json.Marshal(map[string]any{"model": "grok-4.5", "messages": messages})
+	cfg := ContextGuardConfig{
+		AutoCompact: true, SoftInputTokens: 100000, MaxInputTokens: 100000,
+		MaxToolResultChars: 3000, KeepRecentMessages: 8,
+	}
+	_, result, err := PrepareAnthropicBody(body, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.EstimatedBefore >= cfg.SoftInputTokens {
+		t.Fatalf("test body must be below configured soft limit: %+v", result)
+	}
+	if !result.Applied || result.EstimatedAfter > cfg.MaxInputTokens*4/5 {
+		t.Fatalf("expected safety-headroom compaction: %+v", result)
+	}
+}
