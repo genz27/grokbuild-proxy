@@ -8,14 +8,15 @@ import (
 
 // MessageResponse is the Anthropic non-stream message response.
 type MessageResponse struct {
-	ID         string         `json:"id"`
-	Type       string         `json:"type"`
-	Role       string         `json:"role"`
-	Model      string         `json:"model"`
-	Content    []ContentBlock `json:"content"`
-	StopReason string         `json:"stop_reason"`
-	StopSeq    *string        `json:"stop_sequence"`
-	Usage      Usage          `json:"usage"`
+	ID                string         `json:"id"`
+	Type              string         `json:"type"`
+	Role              string         `json:"role"`
+	Model             string         `json:"model"`
+	Content           []ContentBlock `json:"content"`
+	StopReason        string         `json:"stop_reason"`
+	StopSeq           *string        `json:"stop_sequence"`
+	Usage             Usage          `json:"usage"`
+	ContextManagement map[string]any `json:"context_management,omitempty"`
 }
 
 // ContentBlock is a Claude content block.
@@ -42,7 +43,8 @@ type TranslateRespOptions struct {
 	// FallbackModel used when response has no model and RequestModel empty.
 	FallbackModel string
 	// Thinking enables CPA-style Responses reasoning → Anthropic thinking blocks.
-	Thinking ThinkingBridgeOptions
+	Thinking          ThinkingBridgeOptions
+	ContextManagement map[string]any
 }
 
 // TranslateResponse converts a Grok/OpenAI Responses JSON body into an Anthropic message.
@@ -89,6 +91,9 @@ func TranslateResponse(raw []byte, opts TranslateRespOptions) (*MessageResponse,
 		StopReason: "end_turn",
 		StopSeq:    nil,
 		Usage:      Usage{},
+	}
+	if opts.ContextManagement != nil {
+		msg.ContextManagement = opts.ContextManagement
 	}
 
 	if uRaw, ok := root["usage"]; ok && len(uRaw) > 0 {

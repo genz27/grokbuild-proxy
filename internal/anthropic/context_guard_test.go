@@ -231,3 +231,14 @@ func TestAutoCompactKeepsTokenizerSafetyHeadroom(t *testing.T) {
 		t.Fatalf("expected safety-headroom compaction: %+v", result)
 	}
 }
+
+func TestContextManagementMetadataReportsAppliedEdits(t *testing.T) {
+	metadata := contextManagementMetadata(CompactResult{Applied: true, DroppedMessages: 4, TruncatedToolResults: 2})
+	if metadata == nil {
+		t.Fatal("expected context management metadata")
+	}
+	edits, ok := metadata["applied_edits"].([]map[string]any)
+	if !ok || len(edits) != 1 || edits[0]["type"] != "clear_tool_uses_20250919" {
+		t.Fatalf("unexpected metadata: %#v", metadata)
+	}
+}

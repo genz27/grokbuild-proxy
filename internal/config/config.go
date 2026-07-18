@@ -76,7 +76,7 @@ type AnthropicConfig struct {
 	CountTokens         bool              `yaml:"count_tokens"`
 	// Context protection / auto-compact (Claude Code long-session support).
 	// SoftInputTokens triggers auto-compact; MaxInputTokens hard-rejects after compact.
-	// Defaults applied when zero: soft=300000, max=360000, tool_result=120000, keep=16.
+	// Defaults applied when zero: soft=400000, max=460000, tool_result=120000, keep=16.
 	// Keep these high enough that normal Claude Code sessions are not history-stripped.
 	AutoCompact        *bool `yaml:"auto_compact"`
 	SoftInputTokens    int   `yaml:"soft_input_tokens"`
@@ -238,8 +238,8 @@ func Default() Config {
 			PassthroughPrefixes: []string{"grok-"},
 			StripUnknownBetas:   true,
 			CountTokens:         true,
-			SoftInputTokens:     300000,
-			MaxInputTokens:      360000,
+			SoftInputTokens:     400000,
+			MaxInputTokens:      460000,
 			MaxToolResultChars:  120000,
 			KeepRecentMessages:  16,
 		},
@@ -671,17 +671,10 @@ func (c AnthropicConfig) EffectiveSoftInputTokens() int {
 
 // EffectiveMaxInputTokens returns hard reject threshold with defaults.
 func (c AnthropicConfig) EffectiveMaxInputTokens() int {
-	// Leave headroom for translation overhead and tokenizer differences between
-	// the local estimator and the upstream model. The upstream hard limit is
-	// nominally 500k, but sending 460k locally can still overflow upstream.
-	const safeUpstreamBudget = 360000
 	if c.MaxInputTokens > 0 {
-		if c.MaxInputTokens < safeUpstreamBudget {
-			return c.MaxInputTokens
-		}
-		return safeUpstreamBudget
+		return c.MaxInputTokens
 	}
-	return safeUpstreamBudget
+	return 460000
 }
 
 // EffectiveMaxToolResultChars returns tool_result truncation budget.

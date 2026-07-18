@@ -41,8 +41,9 @@ type StreamTranslator struct {
 	// Out is where Claude SSE frames are written (includes "event:" / "data:" lines).
 	Out io.Writer
 	// Flusher optional HTTP flusher.
-	Flusher  http.Flusher
-	Thinking ThinkingBridgeOptions
+	Flusher           http.Flusher
+	Thinking          ThinkingBridgeOptions
+	ContextManagement map[string]any
 
 	blocks              map[string]*streamBlock
 	nextIndex           int
@@ -348,6 +349,9 @@ func (t *StreamTranslator) Finish(stopReason string, usage Usage) error {
 			"input_tokens":  usage.InputTokens,
 			"output_tokens": usage.OutputTokens,
 		},
+	}
+	if t.ContextManagement != nil {
+		delta["context_management"] = t.ContextManagement
 	}
 	if err := t.writeEvent("message_delta", delta); err != nil {
 		return err

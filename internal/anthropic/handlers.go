@@ -180,6 +180,7 @@ func (h *Handlers) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			reqModel = originalModel
 		}
 		tr := NewStreamTranslator(w, flusher, reqModel, thinkingBridge)
+		tr.ContextManagement = contextManagementMetadata(compact, translatedCompact)
 		if err := PipeResponsesSSE(resp.Body, tr); err != nil {
 			if tr.State.Started && !tr.State.Finished {
 				_ = tr.Fail(http.StatusBadGateway, err.Error())
@@ -201,9 +202,10 @@ func (h *Handlers) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	msg, err := TranslateResponse(rawResp, TranslateRespOptions{
-		RequestModel:  probe.Model,
-		FallbackModel: resolved,
-		Thinking:      thinkingBridge,
+		RequestModel:      probe.Model,
+		FallbackModel:     resolved,
+		Thinking:          thinkingBridge,
+		ContextManagement: contextManagementMetadata(compact, translatedCompact),
 	})
 	if err != nil {
 		WriteError(w, http.StatusBadGateway, err.Error())
@@ -213,6 +215,30 @@ func (h *Handlers) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(msg)
+}
+
+func contextManagementMetadata(results ...CompactResult) map[string]any {
+	cleared := 0
+	dropped := 0
+	for _, result := range results {
+		if result.Applied {
+			cleared += result.TruncatedToolResults
+			dropped += result.DroppedMessages
+		}
+	}
+	if cleared == 0 && dropped == 0 {
+		return nil
+	}
+	edit := map[string]any{
+		"type": "clear_tool_uses_20250919",
+	}
+	if cleared > 0 {
+		edit["cleared_tool_uses"] = cleared
+	}
+	if dropped > 0 {
+		edit["dropped_messages"] = dropped
+	}
+	return map[string]any{"applied_edits": []map[string]any{edit}}
 }
 
 func copyAnthropicUpstreamHeaders(dst, src http.Header) {
