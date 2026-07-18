@@ -162,10 +162,11 @@ func prepareBody(raw []byte, cfg ContextGuardConfig, shape bodyShape) (out []byt
 		safetyTarget = cfg.MaxInputTokens
 	}
 	// Local estimation is intentionally lightweight and can undercount the
-	// upstream tokenizer, especially after Anthropic-to-Responses translation.
-	// Keep 20% headroom so an estimated-safe request does not fail upstream.
+	// upstream tokenizer (and the upstream may add a hidden system/tool
+	// prefix). Keep one third of the configured limit as headroom so requests
+	// accepted by this proxy remain below the provider's hard 500k limit.
 	if cfg.MaxInputTokens > 0 {
-		headroomTarget := cfg.MaxInputTokens * 4 / 5
+		headroomTarget := cfg.MaxInputTokens * 2 / 3
 		if headroomTarget > 0 && headroomTarget < safetyTarget {
 			safetyTarget = headroomTarget
 		}
