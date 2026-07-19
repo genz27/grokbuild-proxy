@@ -263,6 +263,19 @@ func prepareBody(raw []byte, cfg ContextGuardConfig, shape bodyShape) (out []byt
 				result.Applied = true
 			}
 		}
+		// Some clients send Responses input items with deeply nested content
+		// shapes that the targeted truncators cannot recognize. As a final
+		// safety net, recursively clamp every text leaf until the serialized
+		// payload is below the configured limit instead of returning a 400.
+		for _, limit := range []int{12000, 6000, 3000, 1500} {
+			if EstimateRawTokens(out) <= cfg.MaxInputTokens {
+				break
+			}
+			if rewritten, changed, terr := forceTrimTextLeaves(out, limit); terr == nil && changed {
+				out = rewritten
+				result.Applied = true
+			}
+		}
 	}
 
 	after := EstimateRawTokens(out)
@@ -275,6 +288,46 @@ func prepareBody(raw []byte, cfg ContextGuardConfig, shape bodyShape) (out []byt
 		)
 	}
 	return out, result, nil
+}
+
+func forceTrimTextLeaves(raw []byte, maxChars int) ([]byte, bool, error) {
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return raw, false, err
+	}
+	changed := forceTrimValue(value, maxChars)
+	if !changed {
+		return raw, false, nil
+	}
+	out, err := json.Marshal(value)
+	return out, true, err
+}
+
+func forceTrimValue(value any, maxChars int) bool {
+	changed := false
+	switch v := value.(type) {
+	case string:
+		return len(v) > maxChars
+	case []any:
+		for i, item := range v {
+			if s, ok := item.(string); ok && len(s) > maxChars {
+				v[i] = TruncateToolResultText(s, maxChars)
+				changed = true
+				continue
+			}
+			changed = forceTrimValue(item, maxChars) || changed
+		}
+	case map[string]any:
+		for key, item := range v {
+			if s, ok := item.(string); ok && len(s) > maxChars {
+				v[key] = TruncateToolResultText(s, maxChars)
+				changed = true
+				continue
+			}
+			changed = forceTrimValue(item, maxChars) || changed
+		}
+	}
+	return changed
 }
 
 func contextSizeBreakdown(raw []byte) string {
